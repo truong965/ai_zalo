@@ -1,0 +1,12 @@
+import { Module } from '@nestjs/common';
+import { AskService } from './ask.service';
+import { SharedModule } from '../shared/shared.module';
+import { InternalClientModule } from '../internal-client/internal-client.module';
+import { SummaryModule } from '../summary/summary.module';
+
+@Module({
+  imports: [SharedModule, InternalClientModule, SummaryModule],
+  providers: [AskService],
+  exports: [AskService],
+})
+export class AskModule {}

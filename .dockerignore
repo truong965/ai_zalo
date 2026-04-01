@@ -1,0 +1,41 @@
+# Dependencies
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Build output
+dist
+build
+*.js.map
+
+# Docker/Infrastructure data (Avoid bloating context)
+ollama_data
+lt-local
+postgres_data
+redis_data
+
+# Environment & Secrets
+.env
+.env.production
+.env.test
+
+# IDE/System files
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Git
+.git
+.gitignore
+
+# Docker related
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+README.md
+implementation_plan.md
+task.md
+walkthrough.md
