@@ -1,20 +1,25 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { GeminiService } from '../shared/gemini.service';
+import { ConfigService } from '@nestjs/config';
 import { TaskType } from '@google/generative-ai';
 import { QdrantService } from '../shared/qdrant.service';
 import { InternalClientService } from '../internal-client/internal-client.service';
 import Redis from 'ioredis';
 import * as crypto from 'crypto';
 import { SummaryService } from '../summary/summary.service';
+import { RerankerService } from '../shared/reranker.service';
+import { ContextCompressorService } from '../shared/context-compressor.service';
 
-type AskMessage = {
+export type AskMessage = {
   id: string;
   content: string;
   senderName: string;
   createdAt: string;
+  windowText?: string;
+  relevanceScore?: number;
 };
 
-type RetrievalPlan = {
+export type RetrievalPlan = {
   recentLimit: number;
   qdrantLimit: number;
   maxRewriteQueries: number;
@@ -25,8 +30,8 @@ export class AskService {
   private readonly logger = new Logger(AskService.name);
   private readonly SESSION_TTL = 1800; // 30 mins
   private readonly CACHE_TTL = 300; // 5 mins (Answer cache)
-  private readonly PASS_1_PLAN: RetrievalPlan = { recentLimit: 20, qdrantLimit: 10, maxRewriteQueries: 0 };
-  private readonly PASS_2_PLAN: RetrievalPlan = { recentLimit: 60, qdrantLimit: 20, maxRewriteQueries: 2 };
+  public readonly PASS_1_PLAN: RetrievalPlan = { recentLimit: 20, qdrantLimit: 10, maxRewriteQueries: 0 };
+  public readonly PASS_2_PLAN: RetrievalPlan = { recentLimit: 60, qdrantLimit: 20, maxRewriteQueries: 2 };
 
   constructor(
     @Inject('REDIS_CLIENT') private readonly redis: Redis,
@@ -34,6 +39,9 @@ export class AskService {
     private readonly geminiService: GeminiService,
     private readonly internalClient: InternalClientService,
     private readonly summaryService: SummaryService,
+    private readonly rerankerService: RerankerService,
+    private readonly compressorService: ContextCompressorService,
+    private readonly configService: ConfigService,
   ) {}
 
   async ask(conversationId: string, userId: string, question: string, isStreaming = false) {
@@ -113,7 +121,7 @@ export class AskService {
       // 4) Tool fallback: if user likely asks for summary and answer is still weak, route to Summary tool.
       if (!isStreaming && isSummaryIntent && this.isInsufficientAnswer(answer)) {
         this.logger.warn(`Routing ask -> summary fallback for conversation ${conversationId}`);
-        const summary = await this.summaryService.summarize(conversationId);
+        const summary = await this.summaryService.summarize(conversationId, userId);
         answer = summary.summary;
       }
 
@@ -134,10 +142,15 @@ export class AskService {
         createdAt: m.createdAt
       }));
 
-      const result = { answer, sources };
+      const result = { 
+        answer, 
+        sources, 
+        context: contextMessages,
+        isCompressed: !!(pass1Context as any).isCompressed 
+      };
 
       // 7. Cache the final answer (Async, don't block)
-      this.redis.set(cacheKey, JSON.stringify(result), 'EX', this.CACHE_TTL).catch(err =>
+      this.redis.set(cacheKey, JSON.stringify({ answer, sources }), 'EX', this.CACHE_TTL).catch(err =>
         this.logger.warn(`Failed to save answer cache: ${err.message}`)
       );
 
@@ -149,13 +162,24 @@ export class AskService {
     }
   }
 
-  private buildAskPrompt(question: string, historyString: string, contextMessages: AskMessage[]): string {
-    const contextString = contextMessages
-      .map(m => `[${m.senderName}] lúc ${new Date(m.createdAt).toLocaleString('vi-VN')}: ${m.content}`)
-      .join('\n');
+  private buildAskPrompt(question: string, historyString: string, context: AskMessage[] | string): string {
+    let contextString = '';
+    
+    if (typeof context === 'string') {
+      contextString = context;
+    } else {
+      // Use compressed text if available from retrieveContext
+      if ((context as any).isCompressed && (context as any).compressedText) {
+        contextString = (context as any).compressedText;
+      } else {
+        contextString = context
+          .map(m => `[${m.senderName}] lúc ${new Date(m.createdAt).toLocaleString('vi-VN')}: ${m.content}`)
+          .join('\n');
+      }
+    }
 
     return `Bạn là một trợ lý AI thông minh phụ trách phân tích lịch sử nhóm chat.
-Dưới đây là các tin nhắn được trích xuất từ lịch sử hội thoại.
+Dưới đây là các dữ liệu được trích xuất từ lịch sử hội thoại.
 Nếu thông tin trong ngữ cảnh KHÔNG liên quan đến câu hỏi, hãy mạnh dạn trả lời rằng bạn không tìm thấy thông tin phù hợp. Tuyệt đối không bịa đặt.
 Nếu tìm thấy câu trả lời, hãy trích dẫn tên người dùng và thời gian khi nhắc đến luận điểm của họ.${historyString}
 
@@ -192,6 +216,47 @@ Trả lời:`;
     return answer;
   }
 
+  /**
+   * Public wrapper for generation logic (for AgentGraph)
+   */
+  async generateAnswer(params: {
+    question: string;
+    context: AskMessage[] | string;
+    userId?: string;
+    conversationId?: string;
+  }): Promise<string> {
+    // 1. Fetch history from redis if available
+    let historyString = '';
+    if (params.userId && params.conversationId) {
+      const sessionKey = `ask_session:${params.userId}:${params.conversationId}`;
+      try {
+        const rawHistory = await this.redis.get(sessionKey);
+        if (rawHistory) {
+          const history = JSON.parse(rawHistory) as { q: string, a: string }[];
+          historyString = `\nLịch sử trò chuyện gần đây của bạn với người dùng:\n` + 
+            history.map(h => `User: ${h.q}\nAssistant: ${h.a}`).join('\n') + `\n`;
+        }
+      } catch (e) {
+        this.logger.warn(`Redis session fetch failed: ${e.message}`);
+      }
+    }
+
+    const prompt = this.buildAskPrompt(params.question, historyString, params.context);
+    return this.geminiService.generateText(prompt);
+  }
+
+  /**
+   * Public wrapper for context retrieval (for AgentGraph)
+   */
+  public async retrieveContextPublic(
+    conversationId: string,
+    userId: string,
+    question: string,
+    plan?: RetrievalPlan,
+  ): Promise<AskMessage[]> {
+    return this.retrieveContext(conversationId, userId, question, plan || this.PASS_1_PLAN);
+  }
+
   private async retrieveContext(
     conversationId: string,
     userId: string,
@@ -201,6 +266,7 @@ Trả lời:`;
     const queries = [question, ...(await this.rewriteQueries(question, plan.maxRewriteQueries))];
     const mergedMap = new Map<string, AskMessage>();
 
+    // Step 1: Fetch recent messages (Fixed window context)
     const recentMessagesRaw = await this.internalClient.getMessages({
       conversationId,
       limit: plan.recentLimit,
@@ -214,26 +280,65 @@ Trả lời:`;
       if (normalized) mergedMap.set(normalized.id, normalized);
     }
 
+    // Step 2: Hybrid Search (Dense + Sparse/BM25) with RRF
     for (const q of queries) {
       try {
         const queryVector = await this.geminiService.embed(q, TaskType.RETRIEVAL_QUERY);
-        const searchResults = await this.qdrantService.search(queryVector, {
+        const searchResults = await this.qdrantService.hybridSearch({
+          denseVector: queryVector,
+          textQuery: q,
           conversationId,
           limit: plan.qdrantLimit,
         });
 
-        for (const hit of (searchResults || [])) {
+        const points = (searchResults as any).points || searchResults || [];
+        for (const hit of points) {
           const normalized = this.normalizeQdrantHit(hit);
           if (normalized) mergedMap.set(normalized.id, normalized);
         }
       } catch (err: any) {
-        this.logger.warn(`Context retrieval failed for query "${q}": ${err.message}`);
+        this.logger.warn(`Hybrid retrieval failed for query "${q}": ${err.message}`);
       }
     }
 
-    return Array.from(mergedMap.values()).sort(
-      (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-    );
+    const uniqueDocs = Array.from(mergedMap.values());
+    if (uniqueDocs.length === 0) return [];
+
+    // Step 3: Reranking with Cohere
+    const topN = this.configService.get<number>('RERANK_TOP_N', 5);
+    const rerankedRaw = await this.rerankerService.rerank({
+      query: question,
+      documents: uniqueDocs.map(d => ({ ...d, text: d.windowText || d.content })),
+      topN,
+    });
+
+    // Map back to AskMessage type to satisfy TS
+    const rerankedDocs: AskMessage[] = rerankedRaw.map(r => {
+      const original = uniqueDocs.find(d => d.id === r.id);
+      return {
+        ...original,
+        relevanceScore: r.relevanceScore,
+      } as AskMessage;
+    });
+
+    // Step 4: Context Compression with GPT-5 Nano
+    const compressionThreshold = this.configService.get<number>('CONTEXT_COMPRESSION_THRESHOLD', 1000);
+    const totalLength = rerankedDocs.reduce((acc, d) => acc + (d.windowText || d.content).length, 0);
+
+    if (totalLength > compressionThreshold) {
+      const compressedText = await this.compressorService.compress({
+        question,
+        contexts: rerankedDocs.map(d => `[${d.senderName}]: ${d.windowText || d.content}`),
+      });
+      
+      // Return a special wrapper that buildAskPrompt understands
+      const result: any = rerankedDocs;
+      result.compressedText = compressedText;
+      result.isCompressed = true;
+      return result;
+    }
+
+    return rerankedDocs.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   }
 
   private async rewriteQueries(question: string, maxRewriteQueries: number): Promise<string[]> {
@@ -280,6 +385,7 @@ Câu hỏi gốc: ${question}`;
     return {
       id,
       content,
+      windowText: hit?.payload?.windowText,
       senderName: hit?.payload?.senderName || 'User',
       createdAt: hit?.payload?.createdAt || new Date().toISOString(),
     };

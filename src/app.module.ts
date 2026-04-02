@@ -46,6 +46,29 @@ import { AppController } from './app.controller';
         // Tools & Fallbacks
         LIBRETRANSLATE_URL: Joi.string().uri().optional(),
         LIBRETRANSLATE_API_KEY: Joi.string().optional().allow(''),
+
+        // OpenAI (GPT-5 Nano for routing/critic)
+        OPENAI_API_KEY: Joi.string().required(),
+        OPENAI_ROUTER_MODEL: Joi.string().default('gpt-5-nano'),
+
+        // Langfuse
+        LANGFUSE_PUBLIC_KEY: Joi.string().optional(),
+        LANGFUSE_SECRET_KEY: Joi.string().optional(),
+        LANGFUSE_BASE_URL: Joi.string().default('https://cloud.langfuse.com'),
+
+        // Quality Thresholds
+        CRITIC_GROUNDEDNESS_THRESHOLD: Joi.number().default(0.7),
+        CRITIC_HALLUCINATION_THRESHOLD: Joi.number().default(0.3),
+        CRAG_RELEVANCE_THRESHOLD: Joi.number().default(0.7),
+        CRAG_MAX_RETRIES: Joi.number().default(1),
+
+        // Phase 3
+        COHERE_API_KEY: Joi.string().optional(),
+        COHERE_RERANK_MODEL: Joi.string().default('rerank-v3.5'),
+        RERANK_TOP_N: Joi.number().default(5),
+        CONTEXT_COMPRESSION_THRESHOLD: Joi.number().default(1000),
+        HYBRID_SEARCH_DENSE_WEIGHT: Joi.number().default(0.7),
+        HYBRID_SEARCH_SPARSE_WEIGHT: Joi.number().default(0.3),
       }),
     }),
     BullModule.forRootAsync({

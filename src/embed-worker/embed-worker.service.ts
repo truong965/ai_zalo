@@ -11,29 +11,58 @@ export class EmbedWorkerService {
   constructor(
     private readonly geminiService: GeminiService,
     private readonly qdrantService: QdrantService,
+    private readonly internalClient: InternalClientService,
   ) {}
 
-  async handleEmbedMessage(data: { messageId: string; conversationId: string; userId: string; text: string; createdAt: string }) {
-    if (!data.text || data.text.trim().length < 5) {
-      this.logger.debug(`Skipping message ${data.messageId}: text too short or empty.`);
+  async handleEmbedMessage(data: { 
+    messageId: string; 
+    conversationId: string; 
+    userId: string; 
+    text: string; 
+    senderName?: string;
+    createdAt: string 
+  }) {
+    if (!data.text || data.text.trim().length < 2) {
+      this.logger.debug(`Skipping message ${data.messageId}: text too short.`);
       return;
     }
 
-    this.logger.debug(`Indexing message ${data.messageId} with Gemini text-embedding-004...`);
     try {
-      // 1. Generate embedding using Gemini (TaskType.RETRIEVAL_DOCUMENT for indexing)
-      const vector = await this.geminiService.embed(data.text, TaskType.RETRIEVAL_DOCUMENT);
+      // 1. Fetch recent context for "Window Chunking" (Sliding window of 3-4 messages)
+      const recentMessagesRaw = await this.internalClient.getMessages({
+        conversationId: data.conversationId,
+        limit: 3,
+        sort: 'desc',
+        userId: data.userId,
+      });
 
-      // 2. Upsert to Qdrant (save exact metadata)
+      const history = ((recentMessagesRaw as any[]) || []).reverse();
+      
+      // 2. Build the window text (Current message + recent context)
+      // This helps capturing the conversation flow in the embedding
+      const contextText = history
+        .map(m => `${m.sender?.displayName || m.userId}: ${m.content || m.text}`)
+        .join('\n');
+      
+      const currentText = `${data.senderName || 'User'}: ${data.text}`;
+      const windowText = contextText ? `${contextText}\n${currentText}` : currentText;
+
+      this.logger.debug(`Indexing message ${data.messageId} with context window...`);
+
+      // 3. Generate embedding for the window
+      const vector = await this.geminiService.embed(windowText, TaskType.RETRIEVAL_DOCUMENT);
+
+      // 4. Upsert to Qdrant with rich payload
       await this.qdrantService.upsert(data.messageId, vector, {
         conversationId: data.conversationId,
         userId: data.userId,
-        text: data.text,
-        sender: 'User',
+        text: data.text,          // Original text for BM25/Exact match
+        windowText: windowText,   // Contextual text for display/Rerank
+        senderName: data.senderName || 'User',
         createdAt: data.createdAt,
       });
 
-      this.logger.log(`Successfully indexed message ${data.messageId}.`);
+      this.logger.log(`Successfully indexed message ${data.messageId} (Window size: ${windowText.length} chars).`);
     } catch (err: any) {
       this.logger.error(`Failed to index message ${data.messageId}: ${err.message}`);
       throw err;

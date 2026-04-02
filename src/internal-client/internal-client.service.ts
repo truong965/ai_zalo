@@ -9,7 +9,7 @@ export interface GetMessagesParams {
   limit?: number;
   offset?: number;
   sort?: 'asc' | 'desc';
-  userId?: string;
+  userId?: string; // Optional at interface level, but enforced in services that require security
 }
 
 @Injectable()

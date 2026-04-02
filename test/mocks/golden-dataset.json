@@ -1,0 +1,54 @@
+{
+  "conversationId": "32cb3ae2-5fa9-42d4-9036-233651bd0edb",
+  "userId": "c33c3638-3d91-4f0e-ac84-6380188c4d37",
+  "testCases": [
+    {
+      "id": "TC001",
+      "question": "Lead của dự án đề xuất sử dụng công nghệ gì cho Backend?",
+      "expectedFact": "NestJS + Socket.io",
+      "category": "Technical Decision"
+    },
+    {
+      "id": "TC002",
+      "question": "Ai là người đề xuất sử dụng Flutter cho Mobile và tại sao?",
+      "expectedFact": "Member 3 (UI/UX) đề xuất vì giúp code nhanh chạy cả iOS lẫn Android trong 3 tháng.",
+      "category": "Attribution"
+    },
+    {
+      "id": "TC003",
+      "question": "Gợi ý dùng PHP thuần và WordPress của ông 5 bị phản ứng như thế nào?",
+      "expectedFact": "Bị Tech Lead (u1) và Dev (u2) phản đối gay gắt, Boss cấm phát biểu 10 phút.",
+      "category": "Negative Content"
+    },
+    {
+      "id": "TC004",
+      "question": "Vấn đề của module Call (WebRTC) gặp phải là gì?",
+      "expectedFact": "WebRTC bị drop connection liên tục.",
+      "category": "Technical Issue"
+    },
+    {
+      "id": "TC005",
+      "question": "Mọi người chốt dùng giao diện Light Mode hay Dark Mode?",
+      "expectedFact": "UI/UX đề xuất Dark Mode vì là xu hướng, mặc dù Dev thấy hơi tối.",
+      "category": "Design Decision"
+    },
+    {
+      "id": "TC006",
+      "question": "Dự án Zalo Clone này dự kiến làm trong bao lâu?",
+      "expectedFact": "3 tháng.",
+      "category": "General Info"
+    },
+    {
+      "id": "TC007",
+      "question": "Lead đề xuất dùng index gì cho Postgres để tăng tốc độ search?",
+      "expectedFact": "GIN index.",
+      "category": "Technical Detail"
+    },
+    {
+      "id": "TC008",
+      "question": "Ông 5 đề xuất lưu tin nhắn vào đâu để dễ search?",
+      "expectedFact": "Lưu vào file .txt.",
+      "category": "Negative Content"
+    }
+  ]
+}

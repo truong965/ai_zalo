@@ -1,4 +1,5 @@
 // npx ts-node scripts/backfill-conversation.ts
+//npm run backfill-conv 32cb3ae2-5fa9-42d4-9036-233651bd0edb
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../src/app.module';
 import { GeminiService } from '../src/shared/gemini.service';
@@ -9,9 +10,14 @@ import { Logger } from '@nestjs/common';
 
 async function backfillConversation() {
   const logger = new Logger('BackfillConversation');
-  const CONV_ID = '32cb3ae2-5fa9-42d4-9036-233651bd0edb';
-  
+
+  // Usage: npm run backfill-conv <CONV_ID> [--clear]
+  const args = process.argv.slice(2);
+  const CONV_ID = args[0] || '32cb3ae2-5fa9-42d4-9036-233651bd0edb';
+  const shouldClear = args.includes('--clear');
+
   logger.log(`Starting prioritized backfill for conversation: ${CONV_ID}...`);
+  if (shouldClear) logger.warn('CLEAR flag detected. Resetting entire collection first.');
 
   const app = await NestFactory.createApplicationContext(AppModule);
   const gemini = app.get(GeminiService);
@@ -19,43 +25,73 @@ async function backfillConversation() {
   const internalClient = app.get(InternalClientService);
 
   try {
-    // We don't clear the collection here, just upsert (it will overwrite if exist)
-    
-    logger.log(`Fetching messages for ${CONV_ID}...`);
-    const messages = await internalClient.getMessages({ 
+    if (shouldClear) {
+      await qdrant.clearCollection();
+    }
+
+    logger.log(`Fetching messages for ${CONV_ID} (ascending to build windows)...`);
+    const messages = await internalClient.getMessages({
       conversationId: CONV_ID,
-      limit: 200 // Get all of them (seed was 100)
+      limit: 500, // Reasonable limit for a single conversation
+      sort: 'asc', // Important for windowing
     });
 
     if (!messages || messages.length === 0) {
       logger.error('No messages found for this conversation in DB.');
+      await app.close();
       return;
     }
 
-    logger.log(`Found ${messages.length} messages. Embedding...`);
+    logger.log(`Found ${messages.length} messages. Embedding with Sliding Window (3 msgs)...`);
 
+    const buffer: any[] = [];
     let processed = 0;
+
     for (const msg of messages) {
-      const text = msg.content || '';
-      if (text.trim().length < 3) continue;
+      try {
+        const text = msg.content || msg.text || '';
+        if (text.trim().length < 2) continue;
 
-      const messageId = msg.id.toString();
-      const vector = await gemini.embed(text, TaskType.RETRIEVAL_DOCUMENT);
-      
-      await qdrant.upsert(messageId, vector, {
-        conversationId: CONV_ID,
-        userId: msg.senderId,
-        text,
-        createdAt: msg.createdAt,
-      });
+        const messageId = msg.id.toString();
 
-      processed++;
-      if (processed % 10 === 0) {
-        logger.log(`Progress: ${processed}/${messages.length} indexed...`);
+        // Build window text
+        const contextText = buffer
+          .map(m => `${m.sender?.displayName || m.senderId || 'User'}: ${m.content || m.text}`)
+          .join('\n');
+
+        const senderName = msg.sender?.displayName || msg.senderId || 'User';
+        const currentText = `${senderName}: ${text}`;
+        const windowText = contextText ? `${contextText}\n${currentText}` : currentText;
+
+        // Generate vector for the window
+        const vector = await gemini.embed(windowText, TaskType.RETRIEVAL_DOCUMENT);
+
+        // Save to Qdrant
+        await qdrant.upsert(messageId, vector, {
+          conversationId: CONV_ID,
+          userId: msg.senderId,
+          text: text,                // Original for BM25
+          windowText: windowText,    // Contextual for display/Rerank
+          senderName,
+          createdAt: msg.createdAt,
+        });
+
+        // Update buffer
+        buffer.push(msg);
+        if (buffer.length > 3) buffer.shift();
+
+        processed++;
+        if (processed % 10 === 0) {
+          logger.log(`Progress: ${processed}/${messages.length} messages indexed...`);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 50));
+      } catch (err: any) {
+        logger.error(`Error processing message ${msg.id}: ${err.message}`);
       }
     }
 
-    logger.log(`SUCCESS: Prioritized backfill complete. Total: ${processed} messages indexed.`);
+    logger.log(`\x1b[32mSUCCESS: Backfill complete for ${CONV_ID}. Total: ${processed} messages indexed.\x1b[0m`);
   } catch (err: any) {
     logger.error(`Failed: ${err.message}`);
   } finally {

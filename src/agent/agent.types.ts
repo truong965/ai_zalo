@@ -7,4 +7,23 @@ export interface AgentJobData {
   messageId?: string;
   text?: string;
   targetLang?: string;
+  // Phase 2: Internal params for CRAG logic
+  cragParams?: {
+    originalQuestion: string;
+    rewrittenQuery?: string;
+    retryCount: number;
+  };
+}
+
+export interface AgentResult {
+  answer: string;
+  sources?: any[];
+  intent?: string;
+  confidence?: number;
+  criticResult?: any; // Phase 2: Evaluation results
+}
+
+export interface ToolResult {
+  result: any;
+  type: BotTriggerType;
 }

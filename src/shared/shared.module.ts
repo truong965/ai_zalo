@@ -5,6 +5,10 @@ import { BullModule } from '@nestjs/bullmq';
 import { GeminiService } from './gemini.service';
 import { QdrantService } from './qdrant.service';
 import { RedisPubsubService } from './redis-pubsub.service';
+import { OpenAIService } from './openai.service';
+import { LangfuseService } from './langfuse.service';
+import { RerankerService } from './reranker.service';
+import { ContextCompressorService } from './context-compressor.service';
 import Redis from 'ioredis';
 import { ConfigService } from '@nestjs/config';
 
@@ -30,6 +34,10 @@ import { ConfigService } from '@nestjs/config';
     GeminiService, 
     QdrantService, 
     RedisPubsubService,
+    OpenAIService,
+    LangfuseService,
+    RerankerService,
+    ContextCompressorService,
     {
       provide: 'REDIS_CLIENT',
       inject: [ConfigService],
@@ -43,6 +51,6 @@ import { ConfigService } from '@nestjs/config';
       },
     }
   ],
-  exports: [GeminiService, QdrantService, RedisPubsubService, BullModule, HttpModule, 'REDIS_CLIENT'],
+  exports: [GeminiService, QdrantService, RedisPubsubService, OpenAIService, LangfuseService, RerankerService, ContextCompressorService, BullModule, HttpModule, 'REDIS_CLIENT'],
 })
 export class SharedModule {}

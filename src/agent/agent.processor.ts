@@ -18,11 +18,11 @@ export class AgentProcessor extends WorkerHost {
     
     switch (job.data.type) {
       case BotTriggerType.TRANSLATE:
-        return this.agentService.handleTranslate(job.data);
       case BotTriggerType.ASK:
-        return this.agentService.handleAsk(job.data);
       case BotTriggerType.SUMMARY:
-        return this.agentService.handleSummary(job.data);
+        return this.agentService.executeTool(job.data);
+      case BotTriggerType.AGENT:
+        return this.agentService.runAgent(job.data);
       default:
         this.logger.warn(`Unknown job type: ${job.data.type}`);
     }

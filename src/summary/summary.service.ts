@@ -22,7 +22,7 @@ export class SummaryService {
     @Inject('REDIS_CLIENT') private readonly redis: Redis,
   ) {}
 
-  async summarize(conversationId: string): Promise<SummaryResult> {
+  async summarize(conversationId: string, userId: string): Promise<SummaryResult> {
     const cacheKey = this.buildCacheKey(conversationId);
     
     // 1. Check cache
@@ -41,6 +41,7 @@ export class SummaryService {
     const messages = await this.internalClient.getMessages({
       conversationId,
       limit: this.DEFAULT_MESSAGE_COUNT,
+      userId, // Mandatory for security
     });
 
     if (!messages || messages.length === 0) {

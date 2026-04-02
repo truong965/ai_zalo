@@ -1,11 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { TriggerBotDto } from './dto/trigger-bot.dto';
+import { TriggerBotDto, BotTriggerType } from './dto/trigger-bot.dto';
+import { AgentService } from '../agent/agent.service';
 import { AgentJobData } from '../agent/agent.types';
-import { TranslateService } from '../translate/translate.service';
-import { AskService } from '../ask/ask.service';
-import { InternalClientService } from '../internal-client/internal-client.service';
 
 @Injectable()
 export class BotGatewayService {
@@ -13,59 +11,38 @@ export class BotGatewayService {
 
   constructor(
     @InjectQueue('ai-job') private readonly aiJobQueue: Queue,
-    private readonly translateService: TranslateService,
-    private readonly askService: AskService,
-    private readonly internalClient: InternalClientService,
+    private readonly agentService: AgentService,
   ) { }
 
+  /**
+   * Main entry point for bot triggers from Main App.
+   */
   async handleTrigger(dto: TriggerBotDto): Promise<any> {
     this.logger.log(`Received bot trigger: ${dto.type} in conversation ${dto.conversationId}`);
 
-    // Fast-track interactive tools (Synchronous)
-    if (dto.type === 'translate' && dto.messageId && dto.targetLang) {
-      this.logger.debug(`Fast-tracking translation for message ${dto.messageId}`);
-      // 1. Fetch message text
-      const messages = await this.internalClient.getMessages({
-        messageIds: [dto.messageId],
-        conversationId: dto.conversationId
-      });
+    // If it's not a generic 'agent' intent, or it's a fixed tool trigger
+    if (dto.type !== BotTriggerType.AGENT) {
       
-      if (!messages || messages.length === 0) {
-        this.logger.error(`Message ${dto.messageId} not found in Backend DB`);
-        throw new Error('Message not found');
-      }
-
-      const text = messages[0].content || messages[0].text;
-      this.logger.debug(`Successfully fetched message content: "${text}"`);
-
-      // 2. Translate
-      const result = await this.translateService.translate(text, dto.targetLang);
-      this.logger.debug(`Translation success: ${JSON.stringify(result)}`);
-      return result;
-    }
-
-    if (dto.type === 'ask' && dto.text) {
-      this.logger.debug(`Fast-tracking RAG query for conversation ${dto.conversationId}`);
-      
-      if (dto.stream) {
-        // Fire and forget: unblock the HTTP or calling client immediately
-        this.askService.ask(dto.conversationId, dto.userId, dto.text, true).catch(err => {
-          this.logger.error(`Stream background ask failed for ${dto.conversationId}: ${err.message}`);
+      // Handle streaming 'ask' in fire-and-forget mode
+      if (dto.type === BotTriggerType.ASK && dto.stream) {
+        this.logger.debug('Fast-tracking streaming ask');
+        this.agentService.executeTool(dto).catch(err => {
+          this.logger.error(`Stream execution background failure: ${err.message}`);
         });
         return { message: 'Streaming initiated', status: 'streaming' };
       }
 
-      return await this.askService.ask(dto.conversationId, dto.userId, dto.text, false);
+      // Fast-track explicit tool calls (Synchronous)
+      return this.agentService.executeTool(dto);
     }
 
-    // Standard tools (Asynchronous via Queue)
+    // Natural Language / Generic Agent intent -> Async processing via Queue
     const jobData: AgentJobData = {
       type: dto.type,
       conversationId: dto.conversationId,
       userId: dto.userId,
-      messageId: dto.messageId,
       text: dto.text,
-      targetLang: dto.targetLang,
+      // params usually not provided for 'agent' type from requester
     };
 
     const job = await this.aiJobQueue.add('process-request', jobData, {
@@ -74,8 +51,9 @@ export class BotGatewayService {
       removeOnComplete: true,
     });
 
+    this.logger.debug(`Agent request queued: jobId=${job.id}`);
     return {
-      message: `${dto.type} request queued successfully`,
+      message: 'Agent request queued successfully',
       jobId: job.id
     };
   }

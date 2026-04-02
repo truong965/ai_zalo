@@ -5,35 +5,29 @@ import { GoogleGenerativeAI, TaskType, GenerativeModel } from '@google/generativ
 @Injectable()
 export class GeminiService implements OnModuleInit {
   private readonly logger = new Logger(GeminiService.name);
-  private ai: GoogleGenerativeAI;
-  private embeddingModel: GenerativeModel;
-  private llmModel: GenerativeModel;
-  private embeddingOutputDimensionality?: number;
+  private aiInstances: GoogleGenerativeAI[] = [];
+  private currentKeyIndex = 0;
 
   constructor(private configService: ConfigService) {
-    const apiKey = this.configService.getOrThrow<string>('GEMINI_API_KEY');
-    this.ai = new GoogleGenerativeAI(apiKey);
+    const keysConfig = this.configService.getOrThrow<string>('GEMINI_API_KEY');
+    const apiKeys = keysConfig.split(',').map(k => k.trim()).filter(Boolean);
+    
+    if (apiKeys.length === 0) {
+      throw new Error('No Gemini API keys found in configuration.');
+    }
 
-    // Default fast models
-    const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
-    this.llmModel = this.ai.getGenerativeModel({
-      model: modelName,
-    });
+    this.aiInstances = apiKeys.map(key => new GoogleGenerativeAI(key));
+    this.logger.log(`GeminiService initialized with ${apiKeys.length} API keys for rotation.`);
+  }
 
-    const embedModelName = this.configService.get<string>('GEMINI_EMBED_MODEL', 'text-embedding-004');
-    this.embeddingModel = this.ai.getGenerativeModel({
-      model: embedModelName,
-    });
-
-    const qdrantVectorSize = Number(this.configService.get('QDRANT_VECTOR_SIZE') ?? 768);
-    const configuredOutputDimension = this.configService.get('GEMINI_EMBED_OUTPUT_DIMENSION');
-    this.embeddingOutputDimensionality = configuredOutputDimension
-      ? Number(configuredOutputDimension)
-      : qdrantVectorSize;
+  private get nextAI(): GoogleGenerativeAI {
+    const instance = this.aiInstances[this.currentKeyIndex];
+    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.aiInstances.length;
+    return instance;
   }
 
   async onModuleInit() {
-    this.logger.log('GeminiService initialized with GoogleGenerativeAI SDK.');
+    this.logger.log('GeminiService ready for operation.');
   }
 
   /**
@@ -44,10 +38,18 @@ export class GeminiService implements OnModuleInit {
   async embed(text: string, taskType: TaskType = TaskType.RETRIEVAL_DOCUMENT): Promise<number[]> {
     try {
       this.logger.debug(`Embedding text (${text.length} chars) with taskType: ${taskType}`);
-      const result = await this.embeddingModel.embedContent({
+      const model = this.nextAI.getGenerativeModel({
+        model: this.configService.get<string>('GEMINI_EMBED_MODEL', 'text-embedding-004'),
+      });
+
+      const qdrantVectorSize = Number(this.configService.get('QDRANT_VECTOR_SIZE') ?? 768);
+      const configuredOutputDimension = this.configService.get('GEMINI_EMBED_OUTPUT_DIMENSION');
+      const outputDimensionality = configuredOutputDimension ? Number(configuredOutputDimension) : qdrantVectorSize;
+
+      const result = await model.embedContent({
         content: { parts: [{ text }], role: 'user' },
         taskType: taskType,
-        outputDimensionality: this.embeddingOutputDimensionality,
+        outputDimensionality,
       } as any);
 
       return result.embedding.values;
@@ -57,9 +59,6 @@ export class GeminiService implements OnModuleInit {
     }
   }
 
-  /**
-   * Generate a completion string synchronously.
-   */
   async generateText(
     prompt: string,
     options?: { maxTokens?: number; temperature?: number },
@@ -68,9 +67,8 @@ export class GeminiService implements OnModuleInit {
     try {
       this.logger.debug(`Calling Gemini LLM...`);
 
-      // Override config transiently if necessary
       const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
-      const model = this.ai.getGenerativeModel({
+      const model = this.nextAI.getGenerativeModel({
         model: modelName,
         generationConfig: {
           maxOutputTokens: options?.maxTokens,
@@ -91,9 +89,6 @@ export class GeminiService implements OnModuleInit {
     }
   }
 
-  /**
-   * Generate a completion string using Server-Sent Events (Streaming)
-   */
   async *streamText(
     prompt: string,
     options?: { maxTokens?: number; temperature?: number },
@@ -103,7 +98,7 @@ export class GeminiService implements OnModuleInit {
       this.logger.debug(`Streaming Gemini LLM...`);
 
       const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
-      const model = this.ai.getGenerativeModel({
+      const model = this.nextAI.getGenerativeModel({
         model: modelName,
         generationConfig: {
           maxOutputTokens: options?.maxTokens,

@@ -2,9 +2,9 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { AskService } from '../ask/ask.service';
 
-export function createAskTool(askService: AskService, userId: string = 'system') {
+export function createAskTool(askService: AskService) {
   return tool(
-    async ({ question, conversationId }) => {
+    async ({ question, conversationId, userId }) => {
       const result = await askService.ask(conversationId, userId, question);
 
       const sourcesText = result.sources
@@ -22,6 +22,7 @@ export function createAskTool(askService: AskService, userId: string = 'system')
       schema: z.object({
         question: z.string().describe('Câu hỏi về lịch sử chat'),
         conversationId: z.string().describe('ID của cuộc trò chuyện'),
+        userId: z.string().describe('ID của người dùng hiện tại đang yêu cầu tìm kiếm'),
       }),
     },
   );

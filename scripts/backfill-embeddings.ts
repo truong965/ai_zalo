@@ -25,7 +25,7 @@ async function backfill() {
     await qdrant.clearCollection();
 
     // Phase 2: Iterate through all messages in ascending order to build windows
-    const buffers = new Map<string, any[]>(); // conversationId -> MessageBuffer
+    const windowBuffers = new Map<string, any[]>(); // conversationId -> MessageBuffer (last 3)
 
     while (true) {
       logger.log(`Fetching messages from Backend (offset: ${offset}, limit: ${PAGE_SIZE}, sort: asc)...`);
@@ -36,54 +36,55 @@ async function backfill() {
         sort: 'asc',
       });
 
-      if (!messages || messages.length === 0) {
-        logger.log('Reached the end of message history.');
-        break;
-      }
-
-      logger.log(`Batch received: ${messages.length} messages. Processing windows...`);
+      if (!messages || messages.length === 0) break;
 
       for (const msg of messages) {
         try {
-          const text = msg.content || '';
-          if (text.trim().length < 2) continue; // Allow shorter messages in windows
+          const text = msg.content || msg.text || '';
+          if (text.trim().length < 2) continue;
 
           const conversationId = msg.conversationId;
           const messageId = msg.id.toString();
-          const userId = msg.senderId;
-          const createdAt = msg.createdAt;
           
-          // Generate vector for the individual message context
-          const vector = await gemini.embed(text, TaskType.RETRIEVAL_DOCUMENT);
+          // Get previous 3 messages for this conversation to build window
+          let buffer = windowBuffers.get(conversationId) || [];
           
-          // Save to Qdrant
+          const contextText = buffer
+            .map(m => `${m.sender?.displayName || m.senderId || 'User'}: ${m.content || m.text}`)
+            .join('\n');
+          
+          const senderName = msg.sender?.displayName || msg.senderId || 'User';
+          const currentText = `${senderName}: ${text}`;
+          const windowText = contextText ? `${contextText}\n${currentText}` : currentText;
+
+          // Generate vector for the window
+          const vector = await gemini.embed(windowText, TaskType.RETRIEVAL_DOCUMENT);
+          
+          // Save to Qdrant with rich payload
           await qdrant.upsert(messageId, vector, {
             conversationId,
-            userId,
-            text,
-            sender: msg.sender?.displayName || msg.senderId || 'User',
-            createdAt,
+            userId: msg.senderId,
+            text: text,                // Original for BM25
+            windowText: windowText,    // Contextual for display/Rerank
+            senderName,
+            createdAt: msg.createdAt,
           });
 
-          processed++;
-          
-          if (processed % 10 === 0) {
-            logger.log(`Progress: ${processed} messages indexed...`);
-          }
+          // Update sliding window buffer
+          buffer.push(msg);
+          if (buffer.length > 3) buffer.shift();
+          windowBuffers.set(conversationId, buffer);
 
-          // Small throttle
+          processed++;
+          if (processed % 10 === 0) logger.log(`Progress: ${processed} messages indexed...`);
+
           await new Promise(resolve => setTimeout(resolve, 50));
         } catch (err: any) {
           logger.error(`Error processing message ${msg.id}: ${err.message}`);
         }
       }
 
-      // If we got fewer messages than requested, we've hit the end
-      if (messages.length < PAGE_SIZE) {
-        logger.log('All available messages have been processed.');
-        break;
-      }
-
+      if (messages.length < PAGE_SIZE) break;
       offset += PAGE_SIZE;
     }
 
