@@ -5,6 +5,8 @@ export interface TranslateResult {
   targetLang: string;
   skipped: boolean;
   engine: 'gemini' | 'ollama' | 'none';
+  sessionId?: string;
+  fromCache?: boolean;
 }
 
 export class TranslateError extends Error {

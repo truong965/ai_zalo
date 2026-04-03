@@ -32,16 +32,15 @@ export class QdrantService implements OnModuleInit {
       if (exists) {
         const info = await this.client.getCollection(this.collectionName);
         const vectorsConfig = info.config.params.vectors;
-        
-        // Check if using named vectors (object) or single vector (object with size)
+
         const isNamed = !(vectorsConfig as any).size;
         const denseConfig = isNamed ? (vectorsConfig as any).dense : vectorsConfig;
-        
+
         const hasSparse = !!info.config.params.sparse_vectors;
 
         if (!denseConfig || denseConfig.size !== requiredSize || !hasSparse) {
           this.logger.warn(
-            `Collection ${this.collectionName} config mismatch or missing sparse vectors. Re-creating...`
+            `Collection ${this.collectionName} config mismatch or missing sparse vectors. Re-creating...`,
           );
           await this.client.deleteCollection(this.collectionName);
           await this.createCollection(requiredSize, requiredDistance);
@@ -49,20 +48,22 @@ export class QdrantService implements OnModuleInit {
           this.logger.log(`Collection ${this.collectionName} is ready with Hybrid Search support.`);
         }
       } else {
-        this.logger.log(`Collection ${this.collectionName} not found. Creating...`);
         await this.createCollection(requiredSize, requiredDistance);
       }
     } catch (err: any) {
-      this.logger.error(`Failed to ensure Qdrant collection: ${err.message}`);
+      this.logger.error(`Qdrant ensureCollection failed: ${err.message}`);
+      throw err;
     }
   }
 
-  private async createCollection(size: number, distance: any) {
+  private async createCollection(size: number, distance: string) {
+    this.logger.log(`Creating collection ${this.collectionName} with size=${size}, distance=${distance}...`);
+
     await this.client.createCollection(this.collectionName, {
       vectors: {
         dense: {
           size,
-          distance,
+          distance: distance as any,
         },
       },
       sparse_vectors: {
@@ -74,7 +75,6 @@ export class QdrantService implements OnModuleInit {
       },
     });
 
-    // Add indexes for faster filtering
     await this.client.createPayloadIndex(this.collectionName, {
       field_name: 'conversationId',
       field_schema: 'keyword',
@@ -85,18 +85,17 @@ export class QdrantService implements OnModuleInit {
       field_schema: 'datetime',
     });
 
-    // Full-text index for BM25 search
     await this.client.createPayloadIndex(this.collectionName, {
       field_name: 'text',
       field_schema: 'text',
     });
-    
+
     this.logger.log(`Collection ${this.collectionName} created with Hybrid Search (Dense: ${size} + Sparse)`);
   }
 
   async upsert(messageId: string, denseVector: number[], payload: any) {
     this.logger.debug(`Upserting message ${messageId} to Qdrant`);
-    
+
     const pointId = !isNaN(Number(messageId)) ? Number(messageId) : messageId;
 
     try {
@@ -107,12 +106,8 @@ export class QdrantService implements OnModuleInit {
             id: pointId,
             vector: {
               dense: denseVector,
-              // Sparse vector will be automatically indexed if we use Qdrant's internal 
-              // but here we are using manual payload text + full-text index for BM25.
-              // Note: If using Qdrant's sparse vectors feature properly, we'd need to provide sparse indices/values.
-              // For now, we rely on Dense + Text Search if sparse is not fully manual.
             },
-            payload: payload,
+            payload,
           },
         ],
       });
@@ -123,43 +118,50 @@ export class QdrantService implements OnModuleInit {
     }
   }
 
-  /**
-   * Hybrid Search using RRF (Reciprocal Rank Fusion)
-   */
   async hybridSearch(params: {
     denseVector: number[];
     textQuery: string;
     conversationId: string;
     limit?: number;
+    startDate?: string;
+    endDate?: string;
   }) {
     this.logger.debug(`Performing Hybrid Search for conversation ${params.conversationId}`);
-    
+
+    const mustConditions: any[] = [{ key: 'conversationId', match: { value: params.conversationId } }];
+
+    if (params.startDate || params.endDate) {
+      const rangeCondition: any = {};
+      if (params.startDate) rangeCondition.gte = params.startDate;
+      if (params.endDate) rangeCondition.lte = params.endDate;
+      mustConditions.push({ key: 'createdAt', range: rangeCondition });
+    }
+
     try {
-      // In Qdrant 1.10+, we use universal query API for RRF
-      // If version is older, we'd do 2 searches and merge.
-      // Assuming 2026 stack => Qdrant 1.10+
       return await this.client.query(this.collectionName, {
         prefetch: [
           {
             query: params.denseVector,
             using: 'dense',
-            filter: {
-              must: [{ key: 'conversationId', match: { value: params.conversationId } }],
-            },
+            filter: { must: mustConditions },
             limit: (params.limit ?? 10) * 2,
           },
           {
             filter: {
-              must: [
-                { key: 'text', match: { text: params.textQuery } },
-                { key: 'conversationId', match: { value: params.conversationId } },
-              ],
+              must: [...mustConditions],
+              should: params.textQuery
+                .split(/\s+/)
+                .filter(Boolean)
+                .map((token) => ({
+                  key: 'text',
+                  match: { text: token },
+                })),
             },
             limit: (params.limit ?? 10) * 2,
           },
         ],
         query: {
-            fusion: 'rrf'
+          fusion: 'rrf',
         },
         limit: params.limit ?? 10,
         with_payload: true,
@@ -170,13 +172,42 @@ export class QdrantService implements OnModuleInit {
     }
   }
 
+  /**
+   * Bulk update displayName for all messages of a specific user
+   */
+  async updateUserDisplayName(userId: string, newDisplayName: string) {
+    this.logger.log(`Updating displayName for userId ${userId} to "${newDisplayName}"`);
+
+    try {
+      await this.client.setPayload(this.collectionName, {
+        wait: true,
+        payload: {
+          displayName: newDisplayName,
+        },
+        filter: {
+          must: [
+            {
+              key: 'userId',
+              match: { value: userId },
+            },
+          ],
+        },
+      });
+
+      this.logger.log(`Updated displayName payload in Qdrant for user ${userId}`);
+    } catch (err: any) {
+      this.logger.error(`Failed to update displayName for user ${userId}: ${err.message}`);
+      throw err;
+    }
+  }
+
   async search(vector: number[], filter: { conversationId: string; limit?: number }) {
     this.logger.debug(`Searching vector similarity (dense) for conversation ${filter.conversationId}`);
     try {
       return await this.client.search(this.collectionName, {
         vector: {
           name: 'dense',
-          vector: vector,
+          vector,
         },
         filter: {
           must: [

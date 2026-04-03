@@ -56,11 +56,12 @@ async function backfillConversation() {
 
         // Build window text
         const contextText = buffer
-          .map(m => `${m.sender?.displayName || m.senderId || 'User'}: ${m.content || m.text}`)
+          .map(m => `${m.sender?.displayName || m.displayName || 'Thành viên'}: ${m.content || m.text}`)
           .join('\n');
 
-        const senderName = msg.sender?.displayName || msg.senderId || 'User';
-        const currentText = `${senderName}: ${text}`;
+        // Never fallback to UUID as sender name.
+        const displayName = msg.sender?.displayName || 'Thành viên';
+        const currentText = `${displayName}: ${text}`;
         const windowText = contextText ? `${contextText}\n${currentText}` : currentText;
 
         // Generate vector for the window
@@ -72,12 +73,12 @@ async function backfillConversation() {
           userId: msg.senderId,
           text: text,                // Original for BM25
           windowText: windowText,    // Contextual for display/Rerank
-          senderName,
+          displayName,
           createdAt: msg.createdAt,
         });
 
         // Update buffer
-        buffer.push(msg);
+        buffer.push({ ...msg, displayName });
         if (buffer.length > 3) buffer.shift();
 
         processed++;

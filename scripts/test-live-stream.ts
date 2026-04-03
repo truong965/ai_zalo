@@ -18,7 +18,7 @@ const REDIS_PASSWORD = process.env.REDIS_PASSWORD || 'password123';
 const REDIS_DB = Number(process.env.REDIS_DB) || 0;
 
 const API_URL = 'http://localhost:3001/bot/trigger';
-const API_KEY = process.env.MAIN_APP_INTERNAL_API_KEY || 'dev-internal-key';
+const API_KEY = process.env.INTERNAL_API_KEY || 'dev-internal-key';
 
 async function testStreaming() {
   const conversationId = '32cb3ae2-5fa9-42d4-9036-233651bd0edb'; // Seeded conversation

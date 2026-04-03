@@ -1,6 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject } from '@nestjs/common';
 import { OpenAIService } from '../shared/openai.service';
 import { RouterOutput, RouterOutputSchema } from './schemas/router-output.schema';
+import Redis from 'ioredis';
+import * as crypto from 'crypto';
 
 @Injectable()
 export class RouterService {
@@ -30,14 +32,31 @@ Yêu cầu:
 - Nếu là intent "translate", hãy cố gắng trích xuất targetLang (vi, en, ja, ko, zh, fr, de, es, th) trong trường params.targetLang.
 `;
 
-  constructor(private readonly openai: OpenAIService) {}
+  constructor(
+    private readonly openai: OpenAIService,
+    @Inject('REDIS_CLIENT') private readonly redis: Redis,
+  ) {}
 
   /**
-   * Classify user intent using GPT-5 Nano structured output
+   * Classify user intent using GPT-5 Nano structured output with caching
    */
   async classify(text: string, context?: { conversationId?: string }): Promise<RouterOutput> {
     this.logger.debug(`Classifying intent for: "${text}"`);
     
+    // Hash text to use as cache key
+    const hashedText = crypto.createHash('sha256').update(text.trim().toLowerCase()).digest('hex');
+    const cacheKey = `router:cache:${hashedText}`;
+
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) {
+        this.logger.debug(`Router cache hit for: "${text}"`);
+        return JSON.parse(cached) as RouterOutput;
+      }
+    } catch (err) {
+      this.logger.warn(`Redis cache get failed: ${err}`);
+    }
+
     const prompt = `
 Dưới đây là câu hỏi của người dùng:
 "${text}"
@@ -54,6 +73,14 @@ ${context?.conversationId ? `Conversation ID: ${context.conversationId}` : ''}
       );
 
       this.logger.log(`Intent classified: ${result.intent} (Confidence: ${result.confidence})`);
+
+      try {
+        // Cache for 5 minutes (300 seconds)
+        await this.redis.setex(cacheKey, 300, JSON.stringify(result));
+      } catch (err) {
+        this.logger.warn(`Redis cache set failed: ${err}`);
+      }
+
       return result;
     } catch (err: any) {
       this.logger.error(`Router classification failed: ${err.message}`);

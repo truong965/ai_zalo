@@ -28,7 +28,25 @@ export class EmbedWorkerService {
     }
 
     try {
-      // 1. Fetch recent context for "Window Chunking" (Sliding window of 3-4 messages)
+      // 1. Fetch current message to get displayName and recent context for "Window Chunking"
+      let displayName = data.senderName || 'User';
+      
+      try {
+        const currentMsg = await this.internalClient.getMessages({
+          messageIds: [data.messageId],
+          conversationId: data.conversationId,
+          userId: data.userId,
+          limit: 1,
+          sort: 'asc',
+        });
+        
+        if (currentMsg && currentMsg[0]) {
+          displayName = currentMsg[0].sender?.displayName || currentMsg[0].userId || data.senderName || 'User';
+        }
+      } catch (err: any) {
+        this.logger.debug(`Could not fetch displayName for message ${data.messageId}: ${err.message}. Using fallback.`);
+      }
+
       const recentMessagesRaw = await this.internalClient.getMessages({
         conversationId: data.conversationId,
         limit: 3,
@@ -41,10 +59,10 @@ export class EmbedWorkerService {
       // 2. Build the window text (Current message + recent context)
       // This helps capturing the conversation flow in the embedding
       const contextText = history
-        .map(m => `${m.sender?.displayName || m.userId}: ${m.content || m.text}`)
+        .map(m => `${m.sender?.displayName || m.displayName || 'Thành viên'}: ${m.content || m.text}`)
         .join('\n');
       
-      const currentText = `${data.senderName || 'User'}: ${data.text}`;
+      const currentText = `${displayName}: ${data.text}`;
       const windowText = contextText ? `${contextText}\n${currentText}` : currentText;
 
       this.logger.debug(`Indexing message ${data.messageId} with context window...`);
@@ -58,7 +76,7 @@ export class EmbedWorkerService {
         userId: data.userId,
         text: data.text,          // Original text for BM25/Exact match
         windowText: windowText,   // Contextual text for display/Rerank
-        senderName: data.senderName || 'User',
+        displayName: displayName,
         createdAt: data.createdAt,
       });
 

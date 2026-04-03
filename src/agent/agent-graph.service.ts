@@ -2,7 +2,7 @@ import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
 import { StateGraph, START, END } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { BaseMessage, HumanMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
+import { BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
 import { ConfigService } from '@nestjs/config';
 
 import { AgentState } from './schemas/agent-state.schema';
@@ -18,6 +18,7 @@ import { InternalClientService } from '../internal-client/internal-client.servic
 import { CriticService } from './critic.service';
 import { CragService } from './crag.service';
 import { CitationService } from './citation.service';
+import { AIUnifiedResponseEvents } from '../shared/contracts/unified-stream.contract';
 
 @Injectable()
 export class AgentGraphService {
@@ -62,7 +63,13 @@ export class AgentGraphService {
      */
     const reasonerNode = async (state: typeof AgentState.State) => {
       const { messages } = state;
-      const response = await model.invoke(messages);
+      const systemMsg = new SystemMessage({
+        content: `Bạn là Trợ lý AI thông minh trong ứng dụng Zalo Clone. 
+
+Câu hỏi/Yêu cầu hiện tại: ${state.messages[0].content}`
+      });
+      
+      const response = await model.invoke([systemMsg, ...messages]);
       return { messages: [response] };
     };
 
@@ -150,7 +157,7 @@ export class AgentGraphService {
       
       if (lastMessage.tool_calls && lastMessage.tool_calls.length > 0) {
         const toolName = lastMessage.tool_calls[0].name;
-        if (toolName === 'ask') return "grade_docs_path";
+        if (toolName === 'search_chat_history') return "grade_docs_path";
         return "tools_path";
       }
       return END;
@@ -191,7 +198,7 @@ export class AgentGraphService {
       .addConditionalEdges("tools", (state) => {
         const lastMsg = state.messages[state.messages.length -1] as ToolMessage;
         // Check if the output is from 'ask'
-        if ((state.messages[state.messages.length - 2] as any)?.tool_calls?.[0]?.name === 'ask') {
+        if ((state.messages[state.messages.length - 2] as any)?.tool_calls?.[0]?.name === 'search_chat_history') {
           return "grade";
         }
         return "reasoner";
@@ -228,8 +235,16 @@ export class AgentGraphService {
     conversationId: string;
     userId: string;
     routerHint?: RouterOutput;
+    requestId?: string;
+    stream?: boolean;
   }): Promise<{ answer: string; sources?: any[] }> {
-    this.logger.debug(`Running graph V2 for: "${params.question}"`);
+    this.logger.debug(`Running graph V2 for: "${params.question}" (stream: ${params.stream})`);
+
+    const unifiedBase = this.internalClient.createUnifiedBasePayload({
+      requestId: params.requestId,
+      conversationId: params.conversationId,
+      type: 'agent',
+    });
 
     const initialState = {
       messages: [
@@ -248,6 +263,78 @@ Yêu cầu: ${params.question}`
     };
 
     try {
+      if (params.stream) {
+        let finalState: any = null;
+        const nodeMessages: Record<string, string> = {
+          'reasoner': 'Đang suy nghĩ hướng giải quyết...',
+          'grade_docs': 'Đang đánh giá tính liên quan của tài liệu...',
+          'rewrite_query': 'Đang tối ưu lại câu hỏi tìm kiếm...',
+          'generate_answer': 'Đang soạn câu trả lời...',
+          'critic_evaluate': 'Đang đối soát tính chính xác...',
+          'format_citations': 'Đang trích dẫn nguồn tài liệu...',
+        };
+
+        const eventStream = this.graph.streamEvents(initialState, {
+          version: "v2",
+        });
+
+        for await (const event of eventStream) {
+          const eventType = event.event;
+
+          if (eventType === "on_node_start") {
+            const nodeName = event.name;
+            const message = nodeMessages[nodeName];
+            if (message) {
+              await this.internalClient.notifyUnifiedResponse({
+                conversationId: params.conversationId,
+                userId: params.userId,
+                event: AIUnifiedResponseEvents.PROGRESS,
+                payload: { ...unifiedBase, step: nodeName, message },
+              });
+            }
+          } else if (eventType === "on_chat_model_stream") {
+            let chunk = event.data?.chunk?.content;
+            if (chunk && typeof chunk === 'string') {
+              this.logger.debug(`[RAW CHUNK]: ${chunk}`);
+              await this.internalClient.notifyUnifiedResponse({
+                conversationId: params.conversationId,
+                userId: params.userId,
+                event: AIUnifiedResponseEvents.DELTA,
+                payload: { ...unifiedBase, contentDelta: chunk },
+              });
+            }
+          } else if (eventType === "on_tool_start") {
+            await this.internalClient.notifyUnifiedResponse({
+              conversationId: params.conversationId,
+              userId: params.userId,
+              event: AIUnifiedResponseEvents.PROGRESS,
+              payload: {
+                ...unifiedBase,
+                step: `tool_${event.name}`,
+                message: `Đang sử dụng công cụ: ${event.name}...`,
+              },
+            });
+          } else if (eventType === "on_chain_end" && event.name === "LangGraph") {
+            finalState = event.data.output;
+          }
+        }
+
+        if (!finalState) {
+          // Fallback if stream didn't catch the final state
+          finalState = await this.graph.invoke(initialState);
+        }
+
+        return {
+          answer: finalState.finalAnswer || (Array.isArray(finalState.messages) ? finalState.messages[finalState.messages.length - 1].content.toString() : ''),
+          sources: finalState.retrievedDocs?.map((d: any) => ({
+            messageId: d.id,
+            username: d.senderName,
+            text: d.content,
+            createdAt: d.createdAt
+          }))
+        };
+      }
+
       const result = await this.graph.invoke(initialState);
       
       return {

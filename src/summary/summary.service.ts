@@ -1,59 +1,196 @@
-import { Injectable, Logger, Inject } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { GeminiService } from '../shared/gemini.service';
 import { InternalClientService } from '../internal-client/internal-client.service';
-import Redis from 'ioredis';
+import { AiFeatureType } from '../../prisma/generated/client';
+import { SessionCacheService } from '../sessions/session-cache.service';
+import { AIUnifiedResponseEvents } from '../shared/contracts/unified-stream.contract';
 
 export interface SummaryResult {
   summary: string;
   messageCount: number;
   fromTimestamp: string;
   fromCache: boolean;
+  upToDate?: boolean;
+  sessionId?: string;
 }
 
 @Injectable()
 export class SummaryService {
   private readonly logger = new Logger(SummaryService.name);
-  private readonly CACHE_TTL = 1800; // 30 minutes
-  private readonly DEFAULT_MESSAGE_COUNT = 50;
+  private readonly DEFAULT_MESSAGE_COUNT = 300;
 
   constructor(
     private readonly geminiService: GeminiService,
     private readonly internalClient: InternalClientService,
-    @Inject('REDIS_CLIENT') private readonly redis: Redis,
-  ) {}
+    private readonly sessionCache: SessionCacheService,
+  ) { }
 
-  async summarize(conversationId: string, userId: string): Promise<SummaryResult> {
-    const cacheKey = this.buildCacheKey(conversationId);
-    
-    // 1. Check cache
-    try {
-      const cached = await this.redis.get(cacheKey);
-      if (cached) {
-        this.logger.debug(`Summary cache hit for conversation ${conversationId}`);
-        return { ...JSON.parse(cached), fromCache: true };
-      }
-    } catch (err: any) {
-      this.logger.warn(`Redis cache check failed: ${err.message}`);
-    }
-
-    // 2. Fetch messages from Zalo Backend
-    this.logger.log(`Fetching messages to summarize conversation: ${conversationId}`);
-    const messages = await this.internalClient.getMessages({
+  async summarize(
+    conversationId: string, 
+    userId: string, 
+    startMessageId?: string, 
+    endMessageId?: string,
+    startDate?: string,
+    endDate?: string,
+    requestId?: string,
+    isStreaming = false,
+    emitUnifiedEvents = true,
+  ): Promise<SummaryResult> {
+    const unifiedBase = this.internalClient.createUnifiedBasePayload({
+      requestId,
       conversationId,
-      limit: this.DEFAULT_MESSAGE_COUNT,
-      userId, // Mandatory for security
+      type: 'summary',
     });
 
-    if (!messages || messages.length === 0) {
+    if (emitUnifiedEvents) {
+      await this.internalClient.notifyUnifiedResponse({
+        conversationId,
+        userId,
+        event: AIUnifiedResponseEvents.STARTED,
+        payload: {
+          ...unifiedBase,
+          message: 'Started summary generation',
+        },
+      });
+    }
+
+    const hasAccess = await this.internalClient.validateAccess(conversationId, userId);
+    if (!hasAccess) {
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.ERROR,
+          payload: {
+            ...unifiedBase,
+            code: 'SUMMARY_ACCESS_DENIED',
+            message: 'User does not have access to this conversation',
+            retriable: false,
+          },
+        });
+      }
+      throw new Error('User does not have access to this conversation');
+    }
+
+    const isCustomRange = !!(startMessageId || endMessageId || startDate || endDate);
+
+    const latestSessions = await this.sessionCache.listRecentSessions(
+      userId,
+      conversationId,
+      AiFeatureType.SUMMARY,
+      1,
+    );
+    const latestSession = latestSessions[0];
+
+    const limit = isCustomRange ? this.DEFAULT_MESSAGE_COUNT + 1 : this.DEFAULT_MESSAGE_COUNT;
+
+    this.logger.log(`Fetching messages to summarize conversation: ${conversationId}`);
+    if (emitUnifiedEvents) {
+      await this.internalClient.notifyUnifiedResponse({
+        conversationId,
+        userId,
+        event: AIUnifiedResponseEvents.PROGRESS,
+        payload: {
+          ...unifiedBase,
+          step: 'fetch_messages',
+          message: 'Fetching conversation messages',
+        },
+      });
+    }
+
+    const messages = await this.internalClient.getMessages({
+      conversationId,
+      limit,
+      userId, // Mandatory for security
+      after: isCustomRange ? undefined : (latestSession?.lastMessageIdSynced ?? undefined),
+      startMessageId,
+      endMessageId,
+      startDate,
+      endDate,
+    });
+
+    if (isCustomRange && messages.length > this.DEFAULT_MESSAGE_COUNT) {
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.ERROR,
+          payload: {
+            ...unifiedBase,
+            code: 'SUMMARY_RANGE_TOO_LARGE',
+            message: `Summary range exceeds ${this.DEFAULT_MESSAGE_COUNT} messages`,
+            retriable: false,
+          },
+        });
+      }
+      throw new HttpException('Khoảng thời gian tóm tắt quá dài. Vui lòng chọn dưới ' + this.DEFAULT_MESSAGE_COUNT + ' tin nhắn.', HttpStatus.PAYLOAD_TOO_LARGE);
+    }
+
+    if (latestSession && (!messages || messages.length === 0)) {
+      const previousMessages = await this.sessionCache.getSessionMessages(latestSession.id, 10);
+      const latestSummaryMessage = [...previousMessages]
+        .reverse()
+        .find((m) => m.role === 'assistant');
+
+      const content = latestSummaryMessage?.content ?? 'Không có nội dung tóm tắt mới.';
+
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.COMPLETED,
+          payload: {
+            ...unifiedBase,
+            sessionId: latestSession.id,
+            content,
+          },
+        });
+      }
+
       return {
-        summary: 'Chưa có đủ tin nhắn trong cuộc trò chuyện này để thực hiện tóm tắt.',
+        summary: content,
+        messageCount: 0,
+        fromTimestamp: latestSummaryMessage?.createdAt ?? latestSession.updatedAt.toISOString(),
+        fromCache: false,
+        upToDate: true,
+        sessionId: latestSession.id,
+      };
+    }
+
+    if (!messages || messages.length === 0) {
+      const content = 'Chưa có đủ tin nhắn trong cuộc trò chuyện này để thực hiện tóm tắt.';
+
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.COMPLETED,
+          payload: {
+            ...unifiedBase,
+            content,
+          },
+        });
+      }
+
+      return {
+        summary: content,
         messageCount: 0,
         fromTimestamp: new Date().toISOString(),
         fromCache: false,
       };
     }
 
-    // 3. Build conversation text
+    let previousSummary = '';
+    if (latestSession) {
+      const previousMessages = await this.sessionCache.getSessionMessages(latestSession.id, 10);
+      const latestSummaryMessage = [...previousMessages]
+        .reverse()
+        .find((m) => m.role === 'assistant');
+      previousSummary = latestSummaryMessage?.content ?? '';
+    }
+
+    const conversationInfo = await this.internalClient.getConversationInfo(conversationId).catch(() => undefined);
+
     let conversationText = messages
       .sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
       .map((m: any) => {
@@ -69,12 +206,16 @@ export class SummaryService {
       conversationText = conversationText.substring(conversationText.length - 50000);
     }
 
-    // 5. Generate summary via Gemini
-    const prompt = `Bạn là một trợ lý ảo thông minh. Hãy tóm tắt nội dung chính của cuộc trò chuyện sau đây.
+    const prompt = `${previousSummary ? `Bản tóm tắt trước đó:\n${previousSummary}\n\n` : ''}Bạn là một trợ lý ảo thông minh. 
+Ngày hiện tại là: ${new Date().toLocaleString('vi-VN')}.
+Hãy tóm tắt nội dung chính của cuộc trò chuyện sau đây.
 Yêu cầu kết quả trả về bằng Tiếng Việt, trình bày dưới dạng:
 1. **Chủ Đề Chính**: (1-2 câu)
 2. **Các Điểm Quan Trọng**: (danh sách gạch đầu dòng, tối đa 5 điểm)
 3. **Quyết Định/Hành Động**: (nếu có)
+
+Lưu ý: Khi nhắc đến các thành viên trong cuộc hội thoại, hãy sử dụng Tên Hiển Thị của họ (VD: [Trương], [Nguyễn]) thay vì sử dụng mã ID.
+  Không mở đầu bằng lời chào, không dùng câu dẫn nhập dài dòng, và không viết theo văn phong trang trọng nếu không cần.
 
 Nội dung hội thoại:
 <context>
@@ -82,31 +223,153 @@ ${conversationText}
 </context>`;
 
     try {
-      const summary = await this.geminiService.generateText(prompt);
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.PROGRESS,
+          payload: {
+            ...unifiedBase,
+            step: 'generate_summary',
+            message: 'Generating summary with LLM',
+          },
+        });
+      }
+
+      let summary = '';
+      if (isStreaming) {
+        summary = await this.streamSummary(
+          prompt,
+          conversationId,
+          userId,
+          unifiedBase,
+          emitUnifiedEvents,
+        );
+      } else {
+        summary = await this.geminiService.generateText(prompt);
+      }
+      const sortedMessages = messages
+        .filter((m: any) => m?.id)
+        .sort((a: any, b: any) => this.compareMessageIds(a.id, b.id));
+      const lastMessageIdSynced = sortedMessages.length
+        ? String(sortedMessages[sortedMessages.length - 1].id)
+        : latestSession?.lastMessageIdSynced ?? undefined;
+
+      const session = await this.sessionCache.createSession({
+        userId,
+        conversationId,
+        featureType: AiFeatureType.SUMMARY,
+        title: `Summary ${new Date().toISOString()}`,
+        contextSnapshot: {
+          conversationTitle: conversationInfo?.title,
+          conversationType: conversationInfo?.type,
+          participantCount: conversationInfo?.members?.length,
+          basedOnSessionId: latestSession?.id,
+        },
+        lastMessageIdSynced,
+      });
+
+      await this.sessionCache.addSessionMessage(session.id, 'assistant', summary, {
+        engine: 'gemini',
+        incremental: Boolean(latestSession),
+        basedOnSessionId: latestSession?.id,
+      });
+
+      if (lastMessageIdSynced) {
+        await this.sessionCache.updateSessionSyncMarker(session.id, lastMessageIdSynced);
+      }
+
+      await this.sessionCache.enforceSessionLimit({
+        userId,
+        conversationId,
+        featureType: AiFeatureType.SUMMARY,
+        maxActive: 10,
+      });
 
       const result: SummaryResult = {
         summary,
         messageCount: messages.length,
         fromTimestamp: messages[0].createdAt,
         fromCache: false,
+        upToDate: false,
+        sessionId: session.id,
       };
 
-      // 5. Cache result
-      await this.redis.setex(cacheKey, this.CACHE_TTL, JSON.stringify(result));
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.COMPLETED,
+          payload: {
+            ...unifiedBase,
+            sessionId: session.id,
+            content: summary,
+          },
+        });
+      }
 
       return result;
     } catch (err: any) {
       this.logger.error(`Gemini summary generation failed: ${err.message}`);
+
+      if (emitUnifiedEvents) {
+        await this.internalClient.notifyUnifiedResponse({
+          conversationId,
+          userId,
+          event: AIUnifiedResponseEvents.ERROR,
+          payload: {
+            ...unifiedBase,
+            code: 'SUMMARY_GENERATION_FAILED',
+            message: err?.message || 'Summary generation failed',
+            retriable: true,
+          },
+        });
+      }
+
       throw err;
     }
   }
 
-  private buildCacheKey(conversationId: string): string {
-    const now = new Date();
-    // Group by 30-minute buckets for better cache efficiency
-    const bucket = Math.floor(now.getMinutes() / 30);
-    // Format: YYYYMMDDHH + bucket (0 or 1)
-    const timeRef = now.toISOString().substring(0, 13).replace(/[-T]/g, '') + bucket;
-    return `summary:${conversationId}:${timeRef}`;
+  private async streamSummary(
+    prompt: string,
+    conversationId: string,
+    userId: string,
+    unifiedBase: any,
+    emitUnifiedEvents = true,
+  ): Promise<string> {
+    let summary = '';
+    try {
+      const stream = this.geminiService.streamText(prompt);
+      for await (const chunk of stream) {
+        summary += chunk;
+        if (emitUnifiedEvents) {
+          await this.internalClient.notifyUnifiedResponse({
+            conversationId,
+            userId,
+            event: AIUnifiedResponseEvents.DELTA,
+            payload: {
+              ...unifiedBase,
+              contentDelta: chunk,
+            },
+          });
+        }
+      }
+      return summary;
+    } catch (err: any) {
+      this.logger.error(`Summary stream failed: ${err.message}`);
+      throw err;
+    }
+  }
+
+  private compareMessageIds(left: string | number | bigint, right: string | number | bigint): number {
+    try {
+      const a = BigInt(left);
+      const b = BigInt(right);
+      if (a < b) return -1;
+      if (a > b) return 1;
+      return 0;
+    } catch {
+      return String(left).localeCompare(String(right), undefined, { numeric: true });
+    }
   }
 }

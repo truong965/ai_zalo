@@ -35,4 +35,24 @@ export class TriggerBotDto {
   @IsBoolean()
   @IsOptional()
   stream?: boolean;
+
+  @IsString()
+  @IsOptional()
+  requestId?: string;
+
+  @IsString()
+  @IsOptional()
+  startDate?: string;
+
+  @IsString()
+  @IsOptional()
+  endDate?: string;
+
+  @IsString()
+  @IsOptional()
+  startMessageId?: string;
+
+  @IsString()
+  @IsOptional()
+  endMessageId?: string;
 }

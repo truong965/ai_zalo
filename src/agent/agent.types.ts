@@ -7,6 +7,12 @@ export interface AgentJobData {
   messageId?: string;
   text?: string;
   targetLang?: string;
+  stream?: boolean;
+  requestId?: string;
+  startDate?: string;
+  endDate?: string;
+  startMessageId?: string;
+  endMessageId?: string;
   // Phase 2: Internal params for CRAG logic
   cragParams?: {
     originalQuestion: string;

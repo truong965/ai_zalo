@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { BullModule } from '@nestjs/bullmq';
+import { ScheduleModule } from '@nestjs/schedule';
 import * as Joi from 'joi';
 
 import { SharedModule } from './shared/shared.module';
@@ -11,6 +12,8 @@ import { AskModule } from './ask/ask.module';
 import { SummaryModule } from './summary/summary.module';
 import { EmbedWorkerModule } from './embed-worker/embed-worker.module';
 import { InternalClientModule } from './internal-client/internal-client.module';
+import { PrismaModule } from './database/prisma.module';
+import { SessionModule } from './sessions/session.module';
 import { AppController } from './app.controller';
 
 @Module({
@@ -23,13 +26,17 @@ import { AppController } from './app.controller';
 
         // Main App Internal API
         MAIN_APP_INTERNAL_URL: Joi.string().uri().required(),
-        MAIN_APP_INTERNAL_API_KEY: Joi.string().required(),
+        INTERNAL_API_KEY: Joi.string().required(),
+        AI_UNIFIED_STREAM_ENABLED: Joi.boolean().truthy('true').falsy('false').default(false),
 
         // Redis
         REDIS_HOST: Joi.string().default('localhost'),
         REDIS_PORT: Joi.number().default(6379),
         REDIS_PASSWORD: Joi.string().allow('').optional(),
         REDIS_DB: Joi.number().default(0),
+
+        // ai_zalo PostgreSQL
+        AI_DATABASE_URL: Joi.string().pattern(/^postgres(?:ql)?:\/\/.+$/).required(),
 
         // Qdrant
         QDRANT_URL: Joi.string().uri().required(),
@@ -71,6 +78,7 @@ import { AppController } from './app.controller';
         HYBRID_SEARCH_SPARSE_WEIGHT: Joi.number().default(0.3),
       }),
     }),
+    ScheduleModule.forRoot(),
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -84,6 +92,8 @@ import { AppController } from './app.controller';
     }),
     SharedModule,
     InternalClientModule,
+    PrismaModule,
+    SessionModule,
     BotGatewayModule,
     AgentModule,
     TranslateModule,

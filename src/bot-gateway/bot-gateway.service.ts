@@ -2,8 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TriggerBotDto, BotTriggerType } from './dto/trigger-bot.dto';
-import { AgentService } from '../agent/agent.service';
 import { AgentJobData } from '../agent/agent.types';
+import { AgentService } from '../agent/agent.service';
 
 @Injectable()
 export class BotGatewayService {
@@ -20,29 +20,35 @@ export class BotGatewayService {
   async handleTrigger(dto: TriggerBotDto): Promise<any> {
     this.logger.log(`Received bot trigger: ${dto.type} in conversation ${dto.conversationId}`);
 
-    // If it's not a generic 'agent' intent, or it's a fixed tool trigger
-    if (dto.type !== BotTriggerType.AGENT) {
-      
-      // Handle streaming 'ask' in fire-and-forget mode
-      if (dto.type === BotTriggerType.ASK && dto.stream) {
-        this.logger.debug('Fast-tracking streaming ask');
-        this.agentService.executeTool(dto).catch(err => {
-          this.logger.error(`Stream execution background failure: ${err.message}`);
-        });
-        return { message: 'Streaming initiated', status: 'streaming' };
-      }
+    // Keep low-latency UX for streaming ask: start immediately in background.
+    if (dto.type === BotTriggerType.ASK && dto.stream) {
+      this.logger.debug('Fast-path streaming ask request');
+      this.agentService.executeTool(dto).catch((err) => {
+        this.logger.error(`Streaming ask execution failed: ${err.message}`);
+      });
 
-      // Fast-track explicit tool calls (Synchronous)
-      return this.agentService.executeTool(dto);
+      return {
+        accepted: true,
+        status: 'streaming_started',
+        type: dto.type,
+        conversationId: dto.conversationId,
+        requestId: dto.requestId,
+      };
     }
 
-    // Natural Language / Generic Agent intent -> Async processing via Queue
     const jobData: AgentJobData = {
       type: dto.type,
       conversationId: dto.conversationId,
       userId: dto.userId,
       text: dto.text,
-      // params usually not provided for 'agent' type from requester
+      messageId: dto.messageId,
+      targetLang: dto.targetLang,
+      stream: dto.stream,
+      requestId: dto.requestId,
+      startDate: dto.startDate,
+      endDate: dto.endDate,
+      startMessageId: dto.startMessageId,
+      endMessageId: dto.endMessageId,
     };
 
     const job = await this.aiJobQueue.add('process-request', jobData, {
@@ -51,10 +57,14 @@ export class BotGatewayService {
       removeOnComplete: true,
     });
 
-    this.logger.debug(`Agent request queued: jobId=${job.id}`);
+    this.logger.debug(`AI request queued: type=${dto.type}, jobId=${job.id}`);
     return {
-      message: 'Agent request queued successfully',
-      jobId: job.id
+      accepted: true,
+      jobId: job.id,
+      status: 'queued',
+      type: dto.type,
+      conversationId: dto.conversationId,
+      requestId: dto.requestId,
     };
   }
 }

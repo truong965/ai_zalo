@@ -23,36 +23,13 @@ export class CitationService {
       return params.answer;
     }
 
-    const contextStr = params.context
-      .map(m => `ID: ${m.id} | User: ${m.senderName} | Content: ${m.content}`)
+    let formattedAnswer = params.answer;
+    
+    // Deterministic citation: Append sources list at the end
+    const sourcesText = params.context
+      .map((s, i) => `[${i + 1}] ${s.senderName}: "${(s.content || '').substring(0, 100).replace(/\n/g, ' ')}..." (${new Date(s.createdAt).toLocaleDateString('vi-VN')})`)
       .join('\n');
 
-    const prompt = `
-Bạn là một chuyên gia hiệu đính hồ sơ.
-Nhiệm vụ: Chèn các dẫn nguồn (citations) vào CÂU TRẢ LỜI dựa trên các TÀI LIỆU được cung cấp.
-
-Quy tắc:
-1. Mỗi khẳng định sự thật trong câu trả lời phải có dẫn nguồn đi kèm.
-2. Định dạng dẫn nguồn là [src:ID] ngay sau câu khẳng định.
-3. Nếu câu trả lời đã có dẫn nguồn, hãy kiểm tra tính chính xác của ID và định dạng lại nếu cần.
-4. Chỉ dẫn nguồn từ các ID có trong danh sách tài liệu.
-5. Giữ nguyên nội dung và văn phong của câu trả lời gốc, chỉ chèn thêm các marker dẫn nguồn.
-
-== DANH SÁCH TÀI LIỆU ==
-${contextStr}
-
-== CÂU TRẢ LỜI GỐC ==
-${params.answer}
-
-Trả về câu trả lời đã được chèn dẫn nguồn:
-`;
-
-    try {
-      const formatted = await this.gemini.generateText(prompt, { temperature: 0.1 });
-      return formatted || params.answer;
-    } catch (err: any) {
-      this.logger.error(`Citation enforcement failed: ${err.message}`);
-      return params.answer;
-    }
+    return `${formattedAnswer}\n\n📌 Nguồn tham khảo:\n${sourcesText}`;
   }
 }

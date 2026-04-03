@@ -16,7 +16,8 @@ export class BotGatewayController {
     @Body() body: any,
     @Headers('x-internal-api-key') apiKey: string,
   ) {
-    const secret = this.configService.get<string>('MAIN_APP_INTERNAL_API_KEY');
+    const secret =
+      this.configService.get<string>('INTERNAL_API_KEY');
     if (apiKey !== secret) {
       throw new UnauthorizedException('Invalid API Key');
     }

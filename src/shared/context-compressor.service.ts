@@ -1,14 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { OpenAIService } from './openai.service';
-import { z } from 'zod';
-
-const CompressedContextSchema = z.object({
-  compressedContext: z.string().describe('The distilled, relevant context for the query.'),
-  originalTokens: z.number().nullable(),
-  compressedTokens: z.number().nullable(),
-  compressionRatio: z.number().nullable(),
-});
+import { GeminiService } from './gemini.service';
 
 @Injectable()
 export class ContextCompressorService {
@@ -16,11 +8,11 @@ export class ContextCompressorService {
 
   constructor(
     private readonly configService: ConfigService,
-    private readonly openAIService: OpenAIService,
-  ) {}
+    private readonly geminiService: GeminiService,
+  ) { }
 
   /**
-   * Compresses retrieved context to only the most relevant parts using GPT-5 Nano.
+   * Compresses retrieved context to only the most relevant parts using Gemini.
    * This reduces prompt length and focuses the LLM on specific information.
    */
   async compress(params: {
@@ -29,22 +21,27 @@ export class ContextCompressorService {
     maxTokens?: number;
   }): Promise<string> {
     if (params.contexts.length === 0) return '';
-    
+
     // Check if compression is needed based on threshold
     const totalLength = params.contexts.reduce((acc, c) => acc + c.length, 0);
     const threshold = this.configService.get<number>('CONTEXT_COMPRESSION_THRESHOLD', 1000);
-    
+
     if (totalLength < threshold) {
       this.logger.debug(`Context size ${totalLength} < threshold ${threshold}. Skipping compression.`);
       return params.contexts.join('\n\n---\n\n');
     }
 
     try {
-      this.logger.debug(`Compressing context for query: "${params.question}" (${params.contexts.length} chunks)`);
-      
-      const prompt = `Bạn là một chuyên gia nén ngữ cảnh RAG. 
-Nhiệm vụ của bạn là trích xuất các câu hoặc ý quan trọng nhất từ NGỮ CẢNH dưới đây để trả lời CÂU HỎI. 
-Hãy giữ lại các thông tin như tên người gửi, thời gian, và các số liệu cụ thể. Loại bỏ các phần rườm rà không liên quan.
+      this.logger.debug(`Compressing context with Gemini for query: "${params.question}" (${params.contexts.length} chunks)`);
+
+      const prompt = `Bạn là một chuyên gia nén ngữ cảnh RAG cho ứng dụng chat. 
+Nhiệm vụ của bạn là trích xuất các thông tin/câu/đoạn quan trọng nhất từ NGỮ CẢNH dưới đây để trả lời CÂU HỎI. 
+
+QUY TẮC NÉN:
+1. Giữ lại các thông tin như tên người gửi, thời gian cụ thể của tin nhắn, và các số liệu.
+2. Nếu ngữ cảnh chứa các tin nhắn có vẻ là tương lai hoặc quá khứ xa nhưng có mốc thời gian khớp với CÂU HỎI, tuyệt đối không được lọc bỏ.
+3. Loại bỏ các phần rườm rà, chào hỏi không liên quan.
+4. Chỉ trả về nội dung đã nén, không thêm lời dẫn. Nếu không có gì liên quan, hãy trả về bản nén cực ngắn chứa các mốc thời gian chính.
 
 == CÂU HỎI ==
 ${params.question}
@@ -52,17 +49,21 @@ ${params.question}
 == NGỮ CẢNH ==
 ${params.contexts.join('\n\n---\n\n')}
 
-Hãy cung cấp bản nén súc tích nhất nhưng vẫn đảm bảo tính chính xác và đầy đủ cho câu hỏi.`;
+Phần nén:`;
 
-      const result = await this.openAIService.structured(
-        prompt,
-        CompressedContextSchema,
-        'ContextCompression',
-        { temperature: 0, maxTokens: params.maxTokens }
-      );
+      const compressedContext = await this.geminiService.generateText(prompt, {
+        temperature: 0.1,
+        maxTokens: params.maxTokens
+      });
 
-      this.logger.log(`Context compressed. Ratio: ${result.compressionRatio}, Chars: ${result.compressedContext.length}`);
-      return result.compressedContext;
+      // Safety Fallback: Nếu kết quả nén quá ngắn (< 50 ký tự) trong khi đầu vào dài, dùng bản gốc
+      if (compressedContext.length < 50 && totalLength > 200) {
+        this.logger.warn(`Compression gave suspiciously short output (${compressedContext.length} chars). Falling back to original context.`);
+        return params.contexts.join('\n\n---\n\n');
+      }
+
+      this.logger.log(`Context compressed with Gemini. Chars: ${compressedContext.length} (Original: ${totalLength})`);
+      return compressedContext;
     } catch (err: any) {
       this.logger.error(`Context compression failed: ${err.message}. Falling back to full context.`);
       return params.contexts.join('\n\n---\n\n');
