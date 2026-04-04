@@ -4,12 +4,16 @@ import { Logger } from '@nestjs/common';
 import { AgentService } from './agent.service';
 import { AgentJobData } from './agent.types';
 import { BotTriggerType } from '../bot-gateway/dto/trigger-bot.dto';
+import { CriticService } from './critic.service';
 
 @Processor('ai-job')
 export class AgentProcessor extends WorkerHost {
   private readonly logger = new Logger(AgentProcessor.name);
 
-  constructor(private readonly agentService: AgentService) {
+  constructor(
+    private readonly agentService: AgentService,
+    private readonly criticService: CriticService,
+  ) {
     super();
   }
 
@@ -22,7 +26,12 @@ export class AgentProcessor extends WorkerHost {
       case BotTriggerType.SUMMARY:
         return this.agentService.executeTool(job.data);
       case BotTriggerType.AGENT:
-        return this.agentService.runAgent(job.data);
+        return this.agentService.runAgent(job.data, job.attemptsMade > 0);
+      case BotTriggerType.CRITIC_EVAL:
+        if (job.data.evalParams) {
+          return this.criticService.evaluate(job.data.evalParams);
+        }
+        return null;
       default:
         this.logger.warn(`Unknown job type: ${job.data.type}`);
     }

@@ -1,6 +1,5 @@
 import { Annotation, messagesStateReducer } from "@langchain/langgraph";
 import { BaseMessage } from "@langchain/core/messages";
-import { RouterOutput } from './router-output.schema';
 
 /**
  * Annotation for defining the StateGraph schema.
@@ -20,28 +19,12 @@ export const AgentState = Annotation.Root({
    */
   conversationId: Annotation<string>(),
   userId: Annotation<string>(),
-  
-  /**
-   * Router output for hint/fast-track
-   */
-  routerResult: Annotation<RouterOutput | null>({
-    reducer: (left: RouterOutput | null, right: RouterOutput | null) => right,
-    default: () => null,
-  }),
 
   /**
    * Phase 2: Retrieved documents (for Ask/RAG)
    */
   retrievedDocs: Annotation<any[] | null>({
     reducer: (left: any[] | null, right: any[] | null) => right,
-    default: () => null,
-  }),
-
-  /**
-   * Phase 2: Critic evaluation result
-   */
-  criticResult: Annotation<any | null>({
-    reducer: (left: any | null, right: any | null) => right,
     default: () => null,
   }),
 
@@ -57,7 +40,7 @@ export const AgentState = Annotation.Root({
    * Phase 2: Retry count for CRAG/Critic loop
    */
   retryCount: Annotation<number>({
-    reducer: (left: number, right: number) => left + right,
+    reducer: (left: number, right: number) => right,
     default: () => 0,
   }),
   

@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { TriggerBotDto, BotTriggerType } from './dto/trigger-bot.dto';
 import { AgentJobData } from '../agent/agent.types';
 import { AgentService } from '../agent/agent.service';
+import { AbortManagerService } from '../agent/abort-manager.service';
 
 @Injectable()
 export class BotGatewayService {
@@ -12,6 +13,7 @@ export class BotGatewayService {
   constructor(
     @InjectQueue('ai-job') private readonly aiJobQueue: Queue,
     private readonly agentService: AgentService,
+    private readonly abortManager: AbortManagerService,
   ) { }
 
   /**
@@ -19,6 +21,9 @@ export class BotGatewayService {
    */
   async handleTrigger(dto: TriggerBotDto): Promise<any> {
     this.logger.log(`Received bot trigger: ${dto.type} in conversation ${dto.conversationId}`);
+
+    // Xóa cờ cancel nếu có (người dùng đã gửi trigger mới, cancel trước đó không còn hiệu lực)
+    this.abortManager.clearConversationCancel(dto.conversationId);
 
     // Keep low-latency UX for streaming ask: start immediately in background.
     if (dto.type === BotTriggerType.ASK && dto.stream) {

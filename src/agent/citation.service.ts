@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { GeminiService } from '../shared/gemini.service';
-import { AskMessage } from '../ask/ask.service';
+import { AskMessage } from '../ask/retriever.service';
 
 @Injectable()
 export class CitationService {

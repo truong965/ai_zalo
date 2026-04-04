@@ -5,6 +5,7 @@ export enum BotTriggerType {
   ASK = 'ask',
   SUMMARY = 'summary',
   AGENT = 'agent',
+  CRITIC_EVAL = 'critic_eval',
 }
 
 export class TriggerBotDto {

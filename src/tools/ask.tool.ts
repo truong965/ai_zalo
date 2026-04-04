@@ -1,11 +1,17 @@
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
-import { AskService } from '../ask/ask.service';
+import { RetrieverService } from '../ask/retriever.service';
 
-export function createAskTool(askService: AskService) {
+export function createAskTool(retrieverService: RetrieverService) {
   return tool(
     async ({ question, conversationId, userId, startDate, endDate }) => {
-      const messages = await askService.retrieveOnly(conversationId, userId, question, startDate, endDate);
+      // Simply retrieve context without grading or retry loops.
+      // This logic delegates grading and rewriting to the LangGraph node.
+      const messages = await retrieverService.retrieveOnly(conversationId, userId, question, startDate, endDate);
+
+      if (!messages || messages.length === 0) {
+        return "INCORRECT_CONTEXT: KHÔNG TÌM THẤY TÀI LIỆU PHÙ HỢP TRONG LỊCH SỬ. Hãy thông báo cho user là không tìm thấy thông tin.";
+      }
 
       return JSON.stringify({ context: messages });
     },

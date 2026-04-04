@@ -4,6 +4,7 @@ import { InternalClientService } from '../internal-client/internal-client.servic
 import { AiFeatureType } from '../../prisma/generated/client';
 import { SessionCacheService } from '../sessions/session-cache.service';
 import { AIUnifiedResponseEvents } from '../shared/contracts/unified-stream.contract';
+import { AbortUtils } from '../shared/abort.utils';
 
 export interface SummaryResult {
   summary: string;
@@ -35,6 +36,7 @@ export class SummaryService {
     requestId?: string,
     isStreaming = false,
     emitUnifiedEvents = true,
+    signal?: AbortSignal,
   ): Promise<SummaryResult> {
     const unifiedBase = this.internalClient.createUnifiedBasePayload({
       requestId,
@@ -244,9 +246,10 @@ ${conversationText}
           userId,
           unifiedBase,
           emitUnifiedEvents,
+          signal,
         );
       } else {
-        summary = await this.geminiService.generateText(prompt);
+        summary = await this.geminiService.generateText(prompt, { signal });
       }
       const sortedMessages = messages
         .filter((m: any) => m?.id)
@@ -310,6 +313,10 @@ ${conversationText}
 
       return result;
     } catch (err: any) {
+      if (AbortUtils.isAbortError(err)) {
+        this.logger.debug(`Gemini summary generation cancelled by user for conversation ${conversationId}`);
+        throw err;
+      }
       this.logger.error(`Gemini summary generation failed: ${err.message}`);
 
       if (emitUnifiedEvents) {
@@ -336,10 +343,11 @@ ${conversationText}
     userId: string,
     unifiedBase: any,
     emitUnifiedEvents = true,
+    signal?: AbortSignal,
   ): Promise<string> {
     let summary = '';
     try {
-      const stream = this.geminiService.streamText(prompt);
+      const stream = this.geminiService.streamText(prompt, { signal });
       for await (const chunk of stream) {
         summary += chunk;
         if (emitUnifiedEvents) {
@@ -356,6 +364,10 @@ ${conversationText}
       }
       return summary;
     } catch (err: any) {
+      if (AbortUtils.isAbortError(err)) {
+        this.logger.debug(`Summary stream cancelled by user for conversation ${conversationId}`);
+        throw err;
+      }
       this.logger.error(`Summary stream failed: ${err.message}`);
       throw err;
     }

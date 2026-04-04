@@ -1,12 +1,14 @@
 import { Injectable, Logger, Inject } from '@nestjs/common';
-import { OpenAIService } from '../shared/openai.service';
+import { LlmGatewayService } from '../shared/llm-gateway.service';
 import { RouterOutput, RouterOutputSchema } from './schemas/router-output.schema';
 import Redis from 'ioredis';
 import * as crypto from 'crypto';
+import { AbortUtils } from 'src/shared/abort.utils';
 
 @Injectable()
 export class RouterService {
   private readonly logger = new Logger(RouterService.name);
+  private readonly CACHE_TTL = 3600; // 1 hour for intent routing cache
 
   private readonly SYSTEM_PROMPT = `
 Bạn là một bộ phân loại intent cho ứng dụng chat AI assistant (ai_zalo). 
@@ -33,16 +35,20 @@ Yêu cầu:
 `;
 
   constructor(
-    private readonly openai: OpenAIService,
+    private readonly openai: LlmGatewayService,
     @Inject('REDIS_CLIENT') private readonly redis: Redis,
-  ) {}
+  ) { }
 
   /**
-   * Classify user intent using GPT-5 Nano structured output with caching
+   * Classify user intent using GPT-5 Nano structured output with optional reasoning streaming
    */
-  async classify(text: string, context?: { conversationId?: string }): Promise<RouterOutput> {
+  async classify(
+    text: string,
+    context?: { conversationId?: string; signal?: AbortSignal },
+    onThought?: (chunk: string) => void
+  ): Promise<RouterOutput> {
     this.logger.debug(`Classifying intent for: "${text}"`);
-    
+
     // Hash text to use as cache key
     const hashedText = crypto.createHash('sha256').update(text.trim().toLowerCase()).digest('hex');
     const cacheKey = `router:cache:${hashedText}`;
@@ -51,7 +57,11 @@ Yêu cầu:
       const cached = await this.redis.get(cacheKey);
       if (cached) {
         this.logger.debug(`Router cache hit for: "${text}"`);
-        return JSON.parse(cached) as RouterOutput;
+        const result = JSON.parse(cached) as RouterOutput;
+        if (onThought && result.reasoning) {
+          onThought(result.reasoning);
+        }
+        return result;
       }
     } catch (err) {
       this.logger.warn(`Redis cache get failed: ${err}`);
@@ -66,11 +76,24 @@ ${context?.conversationId ? `Conversation ID: ${context.conversationId}` : ''}
 `;
 
     try {
-      const result = await this.openai.structured(
-        this.SYSTEM_PROMPT + prompt,
-        RouterOutputSchema,
-        'router_output'
-      );
+      let result: RouterOutput;
+
+      if (onThought) {
+        result = await this.openai.structuredStream(
+          this.SYSTEM_PROMPT + prompt,
+          RouterOutputSchema,
+          'router_output',
+          onThought,
+          { signal: context?.signal }
+        );
+      } else {
+        result = await this.openai.structured(
+          this.SYSTEM_PROMPT + prompt,
+          RouterOutputSchema,
+          'router_output',
+          { signal: context?.signal }
+        );
+      }
 
       this.logger.log(`Intent classified: ${result.intent} (Confidence: ${result.confidence})`);
 
@@ -83,6 +106,10 @@ ${context?.conversationId ? `Conversation ID: ${context.conversationId}` : ''}
 
       return result;
     } catch (err: any) {
+      if (AbortUtils.isAbortError(err)) {
+        this.logger.debug(`Router classification cancelled by user`);
+        throw err;
+      }
       this.logger.error(`Router classification failed: ${err.message}`);
       // Fallback to clarify if LLM fails
       return {
@@ -101,7 +128,7 @@ ${context?.conversationId ? `Conversation ID: ${context.conversationId}` : ''}
   /**
    * Rewrite an ambiguous user message for better classification
    */
-  async rewriteForClarity(text: string): Promise<string> {
+  async rewriteForClarity(text: string, signal?: AbortSignal): Promise<string> {
     this.logger.debug(`Rewriting for clarity: "${text}"`);
 
     const prompt = `
@@ -115,8 +142,12 @@ Chỉ trả về nội dung câu đã viết lại, không giải thích thêm.
 `;
 
     try {
-      return await this.openai.chat([{ role: 'user', content: prompt }], { temperature: 0.3 });
+      return await this.openai.generateText(prompt, { temperature: 0.3, signal });
     } catch (err: any) {
+      if (AbortUtils.isAbortError(err)) {
+        this.logger.debug(`Rewrite for clarity cancelled by user`);
+        throw err;
+      }
       this.logger.error(`Rewrite for clarity failed: ${err.message}`);
       return text;
     }

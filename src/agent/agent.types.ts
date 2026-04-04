@@ -19,6 +19,13 @@ export interface AgentJobData {
     rewrittenQuery?: string;
     retryCount: number;
   };
+  
+  // Phase 2: Internal params for Critic logic
+  evalParams?: {
+    question: string;
+    context: string;
+    answer: string;
+  };
 }
 
 export interface AgentResult {

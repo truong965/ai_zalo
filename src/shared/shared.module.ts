@@ -9,6 +9,8 @@ import { OpenAIService } from './openai.service';
 import { LangfuseService } from './langfuse.service';
 import { RerankerService } from './reranker.service';
 import { ContextCompressorService } from './context-compressor.service';
+import { LangfuseCallbackProvider } from './langfuse-callback.provider';
+import { LlmGatewayService } from './llm-gateway.service';
 import Redis from 'ioredis';
 import { ConfigService } from '@nestjs/config';
 
@@ -18,7 +20,7 @@ import { ConfigService } from '@nestjs/config';
     ConfigModule,
     HttpModule,
     BullModule.registerQueue(
-      { 
+      {
         name: 'embed',
         defaultJobOptions: {
           attempts: 3,
@@ -31,13 +33,15 @@ import { ConfigService } from '@nestjs/config';
     ),
   ],
   providers: [
-    GeminiService, 
-    QdrantService, 
+    GeminiService,
+    QdrantService,
     RedisPubsubService,
     OpenAIService,
     LangfuseService,
     RerankerService,
     ContextCompressorService,
+    LangfuseCallbackProvider,
+    LlmGatewayService,
     {
       provide: 'REDIS_CLIENT',
       inject: [ConfigService],
@@ -51,6 +55,6 @@ import { ConfigService } from '@nestjs/config';
       },
     }
   ],
-  exports: [GeminiService, QdrantService, RedisPubsubService, OpenAIService, LangfuseService, RerankerService, ContextCompressorService, BullModule, HttpModule, 'REDIS_CLIENT'],
+  exports: [GeminiService, QdrantService, RedisPubsubService, OpenAIService, LangfuseService, RerankerService, ContextCompressorService, LangfuseCallbackProvider, LlmGatewayService, BullModule, HttpModule, 'REDIS_CLIENT'],
 })
-export class SharedModule {}
+export class SharedModule { }

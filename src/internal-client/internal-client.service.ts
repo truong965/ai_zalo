@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { lastValueFrom } from 'rxjs';
@@ -14,6 +14,7 @@ import {
   AIUnifiedResponseEventName,
   AIUnifiedResponseEvents,
 } from '../shared/contracts/unified-stream.contract';
+import Redis from 'ioredis';
 
 export interface GetMessagesParams {
   conversationId?: string;
@@ -83,9 +84,10 @@ export class InternalClientService {
   constructor(
     private readonly httpService: HttpService,
     private configService: ConfigService,
+    @Inject('REDIS_CLIENT') private readonly redis: Redis,
   ) {
     this.baseUrl = this.configService.getOrThrow<string>('MAIN_APP_INTERNAL_URL');
-    this.apiKey = this.configService.get<string>('INTERNAL_API_KEY')||'';
+    this.apiKey = this.configService.get<string>('INTERNAL_API_KEY') || '';
     this.unifiedStreamEnabled = this.configService.get<boolean>('AI_UNIFIED_STREAM_ENABLED', false);
   }
 
@@ -140,8 +142,8 @@ export class InternalClientService {
   }
 
   async getSurroundingMessages(
-    conversationId: string, 
-    messageIds: string[], 
+    conversationId: string,
+    messageIds: string[],
     k: number = 5,
     options?: { userId?: string }
   ) {
@@ -174,7 +176,35 @@ export class InternalClientService {
     }
   }
 
+  async countMessages(options: GetMessagesParams): Promise<{ count: number }> {
+    this.logger.debug(`Counting messages for conversation: ${options.conversationId}`);
+    try {
+      const query = new URLSearchParams();
+      if (options.conversationId) query.append('conversationId', options.conversationId);
+      if (options.after) query.append('after', options.after);
+      if (options.userId) query.append('userId', options.userId);
+
+      const response = await lastValueFrom(
+        this.httpService.get<any>(`${this.baseUrl}/internal/ai/messages/count?${query.toString()}`, {
+          headers: this.headers,
+        }),
+      );
+      return response.data?.data || response.data || { count: 0 };
+    } catch (err: any) {
+      this.logger.error(`Error counting messages: ${err.message}`);
+      return { count: 0 };
+    }
+  }
+
   async getConversationInfo(conversationId: string) {
+    const cacheKey = `internal:conv_info:${conversationId}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return JSON.parse(cached);
+    } catch {
+      // Ignore cache err
+    }
+
     this.logger.debug(`Fetching conversation info for ${conversationId}`);
     try {
       const response = await lastValueFrom(
@@ -182,7 +212,13 @@ export class InternalClientService {
           headers: this.headers,
         }),
       );
-      return response.data?.data || response.data;
+      const data = response.data?.data || response.data;
+
+      try {
+        await this.redis.setex(cacheKey, 120, JSON.stringify(data)); // cache 2 mins
+      } catch { }
+
+      return data;
     } catch (err: any) {
       this.logger.error(`Error fetching conversation info: ${err.message}`);
       throw err;
@@ -320,23 +356,23 @@ export class InternalClientService {
       case AIUnifiedResponseEvents.COMPLETED:
         return base.type === 'summary'
           ? {
-              type: 'summary',
-              payload: {
-                ...base,
-                type: base.type,
-                responseType: base.type,
-                content: base.content,
-              },
-            }
+            type: 'summary',
+            payload: {
+              ...base,
+              type: base.type,
+              responseType: base.type,
+              content: base.content,
+            },
+          }
           : {
-              type: 'stream-done',
-              payload: {
-                ...base,
-                type: base.type,
-                responseType: base.type,
-                content: base.content,
-              },
-            };
+            type: 'stream-done',
+            payload: {
+              ...base,
+              type: base.type,
+              responseType: base.type,
+              content: base.content,
+            },
+          };
       case AIUnifiedResponseEvents.ERROR:
         return {
           type: 'stream-error',
@@ -363,6 +399,12 @@ export class InternalClientService {
   }
 
   async validateAccess(conversationId: string, userId: string): Promise<boolean> {
+    const cacheKey = `internal:access:${conversationId}:${userId}`;
+    try {
+      const cached = await this.redis.get(cacheKey);
+      if (cached) return cached === 'true';
+    } catch { }
+
     this.logger.debug(`Validating access for user ${userId} in conversation ${conversationId}`);
     try {
       const response = await lastValueFrom(
@@ -374,7 +416,16 @@ export class InternalClientService {
       );
 
       const responseData = response.data?.data || response.data;
-      return Boolean(responseData?.hasAccess);
+      const hasAccess = Boolean(responseData?.hasAccess);
+
+      if (hasAccess) {
+        try {
+          // Cache successful access check for short interval
+          await this.redis.setex(cacheKey, 60, 'true'); // cache 1 minute
+        } catch { }
+      }
+
+      return hasAccess;
     } catch (err: any) {
       this.logger.error(`Error validating access: ${err.message}`);
       return false;

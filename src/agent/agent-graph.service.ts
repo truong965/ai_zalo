@@ -1,9 +1,11 @@
-import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef, OnModuleInit } from '@nestjs/common';
 import { StateGraph, START, END } from "@langchain/langgraph";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
+import { ToolNode, toolsCondition } from "@langchain/langgraph/prebuilt";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage } from "@langchain/core/messages";
+import { BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage, trimMessages } from "@langchain/core/messages";
 import { ConfigService } from '@nestjs/config';
+import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
+import { Pool } from "pg";
 
 import { AgentState } from './schemas/agent-state.schema';
 import { RouterOutput } from './schemas/router-output.schema';
@@ -11,220 +13,274 @@ import { createAskTool } from '../tools/ask.tool';
 import { createSummaryTool } from '../tools/summary.tool';
 import { createTranslateTool } from '../tools/translate.tool';
 
-import { AskService, AskMessage } from '../ask/ask.service';
-import { SummaryService } from '../summary/summary.service';
-import { TranslateService } from '../translate/translate.service';
+import { RetrieverService } from '../ask/retriever.service';
+import { AskMessage } from '../ask/retriever.service';
 import { InternalClientService } from '../internal-client/internal-client.service';
 import { CriticService } from './critic.service';
 import { CragService } from './crag.service';
 import { CitationService } from './citation.service';
 import { AIUnifiedResponseEvents } from '../shared/contracts/unified-stream.contract';
+import { LangfuseCallbackProvider } from '../shared/langfuse-callback.provider';
+import { LlmGatewayService } from '../shared/llm-gateway.service';
+import { ToolRegistryService } from './tool-registry.service';
+import { AbortManagerService } from './abort-manager.service';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import { BotTriggerType } from '../bot-gateway/dto/trigger-bot.dto';
 
 @Injectable()
-export class AgentGraphService {
+export class AgentGraphService implements OnModuleInit {
   private readonly logger = new Logger(AgentGraphService.name);
   private graph: any;
 
   constructor(
     private configService: ConfigService,
-    @Inject(forwardRef(() => AskService))
-    private askService: AskService,
-    private summaryService: SummaryService,
-    private translateService: TranslateService,
     private internalClient: InternalClientService,
     private criticService: CriticService,
     private cragService: CragService,
     private citationService: CitationService,
-  ) {
-    this.initGraph();
+    private langfuseCallback: LangfuseCallbackProvider,
+    private llmGateway: LlmGatewayService,
+    private toolRegistry: ToolRegistryService,
+    private abortManager: AbortManagerService,
+    @Inject(forwardRef(() => RetrieverService))
+    private retrieverService: RetrieverService,
+    @InjectQueue('ai-job') private readonly aiJobQueue: Queue,
+  ) { }
+
+  async onModuleInit() {
+    await this.initGraph();
   }
 
-  private initGraph() {
-    // 1. Initialize tools
-    const tools = [
-      createAskTool(this.askService),
-      createSummaryTool(this.summaryService),
-      createTranslateTool(this.translateService, this.internalClient),
-    ];
+  private async initGraph() {
+    // 1. Initialize Saver (LangGraph Persistent Memory)
+    const pool = new Pool({
+      connectionString: process.env.AI_DATABASE_URL || process.env.DATABASE_URL,
+      max: 10,
+    });
+    const checkpointer = new PostgresSaver(pool);
+    await checkpointer.setup();
 
+    // 2. Initialize tools from registry
+    const tools = this.toolRegistry.getTools();
     const toolNode = new ToolNode(tools);
 
-    // 2. Initialize Reasoner (Gemini Flash)
-    const model = new (ChatGoogleGenerativeAI as any)({
-      model: this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash'),
-      apiKey: this.configService.getOrThrow<string>('GEMINI_API_KEY'),
-      temperature: 0,
-    }).bindTools(tools);
+    // 3. Initialize Reasoner from LLMGateway (with configured fallbacks)
+    const model = this.llmGateway.getLangchainModel({ temperature: 0, tools });
 
-    // 3. Define the nodes
-
-    /**
-     * Reasoner: Decides what tool to use or if we stop
-     */
-    const reasonerNode = async (state: typeof AgentState.State) => {
+    // 4. Define the nodes
+    const reasonerNode = async (state: typeof AgentState.State, config?: any) => {
       const { messages } = state;
       const systemMsg = new SystemMessage({
-        content: `Bạn là Trợ lý AI thông minh trong ứng dụng Zalo Clone. 
-
-Câu hỏi/Yêu cầu hiện tại: ${state.messages[0].content}`
+        content: `Bạn là trợ lý AI tên Zalo Assistant siêu thông minh. Bạn có toàn quyền sử dụng tất cả tool mà người dùng cấp. 
+Nếu người dùng hỏi về thông tin công việc, chat history, hãy TỰ DO dùng \`search_chat_history\`.
+Nếu User muốn dịch thuật, hãy dùng \`translate\`.
+Hãy luôn trả lời bằng Tiếng Việt thân thiện.
+TRỌNG YẾU: TRƯỚC KHI gọi bất kỳ công cụ nào hoặc quyết định điều gì, bạn BẮT BUỘC phải viết suy nghĩ của mình vào trong thẻ <thought>...</thought>. VÍ DỤ: <thought>Mình cần tìm lịch sử chat về chủ đề X.</thought>
+LUẬT CỨNG: TUYỆT ĐỐI KHÔNG GỌI lệnh dịch thuật quá 1 lần cho cùng 1 câu hỏi, nếu thất bại hãy xin lỗi.
+Câu hỏi/Yêu cầu hiện tại: ${state.messages[0]?.content}`
       });
-      
-      const response = await model.invoke([systemMsg, ...messages]);
+
+      const trimmer = trimMessages({
+        maxTokens: 20, // This acts as maxMessages because of our custom tokenCounter
+        strategy: "last",
+        tokenCounter: (msgs) => msgs.length, // Cắt theo số lượng tin nhắn thay vì token
+        includeSystem: true,
+        allowPartial: false, // Không cắt đôi cặp ToolCall/ToolMessage
+      });
+
+      const trimmedMessages = await trimmer.invoke(messages, config);
+      const response = await model.invoke([systemMsg, ...trimmedMessages], config);
       return { messages: [response] };
     };
 
     /**
-     * Grade Docs: Checks if retrieved context is relevant (CRAG)
+     * CRAG: Validate Context Node
      */
-    const gradeDocsNode = async (state: typeof AgentState.State) => {
-      const lastMessage = state.messages[state.messages.length - 1] as ToolMessage;
-      // The tool result is expected to have 'context' field due to AskService decomposition
-      const toolOutput = JSON.parse(lastMessage.content as string);
-      const context = toolOutput.context || [];
-      
+    const validateContextNode = async (state: typeof AgentState.State) => {
+      const lastMsg = state.messages[state.messages.length - 1] as ToolMessage;
+      let context: any[] = [];
+      try {
+        const parsed = JSON.parse(lastMsg.content as string);
+        if (parsed.context) context = parsed.context;
+      } catch { }
+
+      if (context.length === 0) {
+        return { cragResult: { verdict: 'INCORRECT' } };
+      }
+
+      const topScore = context[0]?.relevanceScore || 0;
+      const CRAG_THRESHOLD = this.configService.get<number>('CRAG_RELEVANCE_THRESHOLD', 0.7);
+
+      if (topScore >= CRAG_THRESHOLD) {
+        return { cragResult: { verdict: 'CORRECT' } };
+      }
+
+      let question = "Context query";
+      // Find the question asked to the tool
+      const aiMessageWithToolCall = state.messages.find(m =>
+        m._getType() === 'ai' && (m as AIMessage).tool_calls?.some(t => t.id === lastMsg.tool_call_id)
+      ) as AIMessage;
+
+      const toolCall = aiMessageWithToolCall?.tool_calls?.find(t => t.id === lastMsg.tool_call_id);
+      if (toolCall && toolCall.args?.question) {
+        question = toolCall.args.question;
+      } else {
+        const lastHumanMsg = state.messages.slice().reverse().find(m => m._getType() === 'human');
+        if (lastHumanMsg) question = lastHumanMsg.content as string;
+      }
+
       const judgment = await this.cragService.gradeDocuments({
-        question: state.messages[0].content as string,
+        question,
         documents: context
       });
 
-      return { 
-        retrievedDocs: context,
-        cragResult: judgment
-      };
+      return { cragResult: judgment };
     };
 
     /**
-     * Rewrite Query: If docs are irrelevant or critic fails, rewrite search (CRAG)
+     * CRAG: Rewrite Query Node
      */
-    const rewriteQueryNode = async (state: typeof AgentState.State) => {
-      const originalQuestion = state.messages[0].content as string;
-      const rewritten = await this.cragService.rewriteQuery({
-        question: originalQuestion,
-        reasoning: state.cragResult?.reasoning || state.criticResult?.reasoning
-      });
+    const cragRewriteNode = async (state: typeof AgentState.State, config?: any) => {
+      const lastMsg = state.messages[state.messages.length - 1] as ToolMessage;
 
-      // Update the question for the next 'ask' call
-      return {
-        messages: [new AIMessage(`Tôi sẽ thử tìm kiếm lại với từ khóa: ${rewritten.queries[0]}`)],
-        retryCount: 1, // Increment retry
-      };
-    };
+      let question = "Context query";
+      const aiMessageWithToolCall = state.messages.find(m =>
+        m._getType() === 'ai' && (m as AIMessage).tool_calls?.some(t => t.id === lastMsg.tool_call_id)
+      ) as AIMessage;
 
-    /**
-     * Generate Answer: Create the RAG response
-     */
-    const generateAnswerNode = async (state: typeof AgentState.State) => {
-      const answer = await this.askService.generateAnswer({
-        question: state.messages[0].content as string,
-        context: state.retrievedDocs || [],
-        userId: state.userId,
-        conversationId: state.conversationId
-      });
-
-      return { finalAnswer: answer };
-    };
-
-    /**
-     * Critic Evaluate: Check for hallucinations (Critic)
-     */
-    const criticEvaluateNode = async (state: typeof AgentState.State) => {
-      const evaluation = await this.criticService.evaluate({
-        question: state.messages[0].content as string,
-        context: (state.retrievedDocs || []).map((m: any) => m.content).join('\n'),
-        answer: state.finalAnswer || ''
-      });
-
-      return { criticResult: evaluation };
-    };
-
-    /**
-     * Format Citations: Add source markers
-     */
-    const formatCitationsNode = async (state: typeof AgentState.State) => {
-      const formatted = await this.citationService.formatWithCitations({
-        answer: state.finalAnswer || '',
-        context: state.retrievedDocs || [],
-        question: state.messages[0].content as string
-      });
-
-      return { finalAnswer: formatted };
-    };
-
-    // --- Conditional Edges ---
-
-    const routingPolicy = (state: typeof AgentState.State) => {
-      const lastMessage = state.messages[state.messages.length - 1] as AIMessage;
-      
-      if (lastMessage.tool_calls && lastMessage.tool_calls.length > 0) {
-        const toolName = lastMessage.tool_calls[0].name;
-        if (toolName === 'search_chat_history') return "grade_docs_path";
-        return "tools_path";
+      const toolCall = aiMessageWithToolCall?.tool_calls?.find(t => t.id === lastMsg.tool_call_id);
+      if (toolCall && toolCall.args?.question) {
+        question = toolCall.args.question;
+      } else {
+        const lastHumanMsg = state.messages.slice().reverse().find(m => m._getType() === 'human');
+        if (lastHumanMsg) question = lastHumanMsg.content as string;
       }
-      return END;
+
+      this.logger.debug(`[CRAG] Rewriting query due to verdict: ${state.cragResult?.verdict}`);
+
+      const rewritten = await this.cragService.rewriteQuery({
+        question,
+        reasoning: state.cragResult?.reasoning || 'Tài liệu tìm thấy trước đó không đủ liên quan.'
+      });
+
+      const newQuery = (rewritten.queries && rewritten.queries.length > 0) ? rewritten.queries[0] : question;
+      const searchDateOptions = toolCall?.args || {};
+
+      const messages = await this.retrieverService.retrieveOnly(
+        state.conversationId,
+        state.userId,
+        newQuery,
+        searchDateOptions.startDate,
+        searchDateOptions.endDate,
+        config?.signal,
+      );
+
+      let newContent = "INCORRECT_CONTEXT: KHÔNG TÌM THẤY TÀI LIỆU PHÙ HỢP TRONG LỊCH SỬ. Hãy thông báo cho user là không tìm thấy thông tin.";
+      if (messages && messages.length > 0) {
+        newContent = JSON.stringify({ context: messages });
+      }
+
+      // Overwrite the tool message in the state
+      const newMessage = new ToolMessage({
+        tool_call_id: lastMsg.tool_call_id,
+        name: lastMsg.name,
+        content: newContent,
+        id: lastMsg.id,
+      });
+
+      return {
+        messages: [newMessage],
+        retryCount: 1,
+      };
     };
 
-    const cragGate = (state: typeof AgentState.State) => {
-      const verdict = state.cragResult?.verdict;
-      if (verdict === 'CORRECT') return "generate";
-      if (verdict === 'AMBIGUOUS' && state.retryCount < 1) return "rewrite";
-      return "generate"; // Fallback to generate anyway or could handle INCORRECT specifically
+    /**
+     * Tự động chấm điểm bằng Critic và Format sau khi Reasoner hoàn tất (ra tới đáp án cuối).
+     */
+    const finalizeNode = async (state: typeof AgentState.State) => {
+      const lastMsg = state.messages[state.messages.length - 1];
+      const answer = lastMsg.content as string;
+
+      // Extract context from previous tool calls if available
+      let retrievedContext: any[] = [];
+      const toolMessages = state.messages.filter(m => m._getType() === 'tool' && m.name === 'search_chat_history');
+      if (toolMessages.length > 0) {
+        try {
+          // Get the very last tool message from ask_history
+          const content = toolMessages[toolMessages.length - 1].content as string;
+          const parsed = JSON.parse(content);
+          if (parsed.context) retrievedContext = parsed.context;
+        } catch (e) { }
+      }
+
+      // Format Citations seamlessly
+      const formatted = await this.citationService.formatWithCitations({
+        answer,
+        context: retrievedContext,
+        question: state.messages[0]?.content as string
+      });
+
+      // P2: Fire Critic Evaluation as Background Job
+      // Provide necessary params mapping
+      this.aiJobQueue.add('critic-eval', {
+        type: BotTriggerType.CRITIC_EVAL,
+        conversationId: state.conversationId,
+        userId: state.userId,
+        text: state.messages[0]?.content as string, // Acts as question
+        // Passing specific eval params implicitly through extra fields or mapped in eval tool
+        evalParams: {
+          question: state.messages[0]?.content as string,
+          context: JSON.stringify(retrievedContext),
+          answer: formatted,
+        }
+      });
+
+      return { finalAnswer: formatted, retrievedDocs: retrievedContext };
     };
 
-    const criticGate = (state: typeof AgentState.State) => {
-      const verdict = state.criticResult?.verdict;
-      if (verdict === 'FAIL' && state.retryCount < 1) return "rewrite";
-      return "finalize";
-    };
-
-    // 4. Build the graph
+    // 5. Build the ReAct Auto-Routing Graph
     const workflow = new StateGraph(AgentState)
       .addNode("reasoner", reasonerNode)
       .addNode("tools", toolNode)
-      .addNode("grade_docs", gradeDocsNode)
-      .addNode("rewrite_query", rewriteQueryNode)
-      .addNode("generate_answer", generateAnswerNode)
-      .addNode("critic_evaluate", criticEvaluateNode)
-      .addNode("format_citations", formatCitationsNode)
+      .addNode("validate_context", validateContextNode)
+      .addNode("crag_rewrite", cragRewriteNode)
+      .addNode("finalize", finalizeNode)
 
       .addEdge(START, "reasoner")
-      
-      .addConditionalEdges("reasoner", routingPolicy, {
-        grade_docs_path: "tools", // Tools carries the 'ask' output
-        tools_path: "tools",
-        [END]: END
+
+      .addConditionalEdges("reasoner", toolsCondition, {
+        tools: "tools",
+        [END]: "finalize"
       })
 
-      // Path for 'ask' tool specifically
-      .addConditionalEdges("tools", (state) => {
-        const lastMsg = state.messages[state.messages.length -1] as ToolMessage;
-        // Check if the output is from 'ask'
-        if ((state.messages[state.messages.length - 2] as any)?.tool_calls?.[0]?.name === 'search_chat_history') {
-          return "grade";
+      .addConditionalEdges("tools", (state: typeof AgentState.State) => {
+        const lastMessage = state.messages[state.messages.length - 1];
+        if (lastMessage?.name === 'search_chat_history') {
+          return "validate_context";
         }
         return "reasoner";
       }, {
-        grade: "grade_docs",
+        validate_context: "validate_context",
         reasoner: "reasoner"
       })
 
-      .addConditionalEdges("grade_docs", cragGate, {
-        generate: "generate_answer",
-        rewrite: "rewrite_query"
+      .addConditionalEdges("validate_context", (state: typeof AgentState.State) => {
+        if (state.cragResult?.verdict === 'CORRECT') return "reasoner";
+        const MAX_RETRIES = this.configService.get<number>('CRAG_MAX_RETRIES', 1);
+        if (state.retryCount < MAX_RETRIES) return "crag_rewrite";
+        return "reasoner";
+      }, {
+        crag_rewrite: "crag_rewrite",
+        reasoner: "reasoner"
       })
 
-      .addEdge("rewrite_query", "reasoner") // Try again with new AI message hint
+      .addEdge("crag_rewrite", "reasoner")
 
-      .addEdge("generate_answer", "critic_evaluate")
+      .addEdge("finalize", END);
 
-      .addConditionalEdges("critic_evaluate", criticGate, {
-        finalize: "format_citations",
-        rewrite: "rewrite_query"
-      })
-
-      .addEdge("format_citations", END);
-
-    this.graph = workflow.compile();
-    this.logger.log("AgentGraph V2 (Quality Stack) successfully compiled.");
+    this.graph = workflow.compile({ checkpointer });
+    this.logger.log("AgentGraph P0 (CRAG nodes + Unified Langfuse) successfully compiled.");
   }
 
   /**
@@ -234,11 +290,10 @@ Câu hỏi/Yêu cầu hiện tại: ${state.messages[0].content}`
     question: string;
     conversationId: string;
     userId: string;
-    routerHint?: RouterOutput;
     requestId?: string;
     stream?: boolean;
   }): Promise<{ answer: string; sources?: any[] }> {
-    this.logger.debug(`Running graph V2 for: "${params.question}" (stream: ${params.stream})`);
+    this.logger.debug(`Running graph P0 for: "${params.question}" (stream: ${params.stream})`);
 
     const unifiedBase = this.internalClient.createUnifiedBasePayload({
       requestId: params.requestId,
@@ -249,17 +304,18 @@ Câu hỏi/Yêu cầu hiện tại: ${state.messages[0].content}`
     const initialState = {
       messages: [
         new HumanMessage({
-          content: `Bối cảnh người dùng:
-- Current User ID: ${params.userId}
-- Current Conversation ID: ${params.conversationId}
-
-Yêu cầu: ${params.question}`
+          content: params.question
         })
       ],
       conversationId: params.conversationId,
       userId: params.userId,
-      routerResult: params.routerHint || null,
-      retryCount: 0,
+    };
+
+    const graphConfig = {
+      configurable: { thread_id: params.conversationId },
+      callbacks: this.langfuseCallback.handler ? [this.langfuseCallback.handler] : [],
+      recursionLimit: 15, // P3 Loop Protection
+      signal: params.requestId ? this.abortManager.get(params.requestId)?.signal : undefined
     };
 
     try {
@@ -267,14 +323,13 @@ Yêu cầu: ${params.question}`
         let finalState: any = null;
         const nodeMessages: Record<string, string> = {
           'reasoner': 'Đang suy nghĩ hướng giải quyết...',
-          'grade_docs': 'Đang đánh giá tính liên quan của tài liệu...',
-          'rewrite_query': 'Đang tối ưu lại câu hỏi tìm kiếm...',
-          'generate_answer': 'Đang soạn câu trả lời...',
-          'critic_evaluate': 'Đang đối soát tính chính xác...',
-          'format_citations': 'Đang trích dẫn nguồn tài liệu...',
+          'validate_context': 'Đang đánh giá mức độ phù hợp của dữ liệu...',
+          'crag_rewrite': 'Dữ liệu chưa đủ, đang tìm kiếm lại...',
+          'finalize': 'Đang định dạng câu trả lời...',
         };
 
         const eventStream = this.graph.streamEvents(initialState, {
+          ...graphConfig,
           version: "v2",
         });
 
@@ -295,7 +350,11 @@ Yêu cầu: ${params.question}`
           } else if (eventType === "on_chat_model_stream") {
             let chunk = event.data?.chunk?.content;
             if (chunk && typeof chunk === 'string') {
-              this.logger.debug(`[RAW CHUNK]: ${chunk}`);
+
+              // Formatting <thought> tags into readable markdown blockquotes
+              chunk = chunk.replace(/<thought>/g, '\n\n> 🤔 *Suy nghĩ:* ');
+              chunk = chunk.replace(/<\/thought>/g, '\n\n');
+
               await this.internalClient.notifyUnifiedResponse({
                 conversationId: params.conversationId,
                 userId: params.userId,
@@ -321,7 +380,7 @@ Yêu cầu: ${params.question}`
 
         if (!finalState) {
           // Fallback if stream didn't catch the final state
-          finalState = await this.graph.invoke(initialState);
+          finalState = await this.graph.invoke(initialState, graphConfig);
         }
 
         return {
@@ -335,8 +394,8 @@ Yêu cầu: ${params.question}`
         };
       }
 
-      const result = await this.graph.invoke(initialState);
-      
+      const result = await this.graph.invoke(initialState, graphConfig);
+
       return {
         answer: result.finalAnswer || result.messages[result.messages.length - 1].content.toString(),
         sources: result.retrievedDocs?.map((d: any) => ({
@@ -347,7 +406,7 @@ Yêu cầu: ${params.question}`
         }))
       };
     } catch (err: any) {
-      this.logger.error(`Graph V2 execution failed: ${err.message}`);
+      this.logger.error(`Graph P0 execution failed: ${err.message}`);
       throw err;
     }
   }

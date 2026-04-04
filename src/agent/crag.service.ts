@@ -1,12 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { OpenAIService } from '../shared/openai.service';
+import { LlmGatewayService } from '../shared/llm-gateway.service';
 import { RelevanceJudgment, RelevanceJudgmentSchema, RewrittenQueries, RewrittenQueriesSchema } from './schemas/crag.schema';
 
 @Injectable()
 export class CragService {
   private readonly logger = new Logger(CragService.name);
 
-  constructor(private readonly openai: OpenAIService) {}
+  constructor(private readonly openai: LlmGatewayService) {}
 
   /**
    * Grade the relevance of retrieved documents to the user question

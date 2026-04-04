@@ -28,24 +28,7 @@ export class EmbedWorkerService {
     }
 
     try {
-      // 1. Fetch current message to get displayName and recent context for "Window Chunking"
       let displayName = data.senderName || 'User';
-      
-      try {
-        const currentMsg = await this.internalClient.getMessages({
-          messageIds: [data.messageId],
-          conversationId: data.conversationId,
-          userId: data.userId,
-          limit: 1,
-          sort: 'asc',
-        });
-        
-        if (currentMsg && currentMsg[0]) {
-          displayName = currentMsg[0].sender?.displayName || currentMsg[0].userId || data.senderName || 'User';
-        }
-      } catch (err: any) {
-        this.logger.debug(`Could not fetch displayName for message ${data.messageId}: ${err.message}. Using fallback.`);
-      }
 
       const recentMessagesRaw = await this.internalClient.getMessages({
         conversationId: data.conversationId,

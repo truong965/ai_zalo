@@ -1,5 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { OpenAIService } from '../shared/openai.service';
+import { ConfigService } from '@nestjs/config';
+import { LlmGatewayService } from '../shared/llm-gateway.service';
+import { LangfuseService } from '../shared/langfuse.service';
 import { CriticOutput, CriticOutputSchema } from './schemas/critic-output.schema';
 
 @Injectable()
@@ -23,7 +25,10 @@ Quy tắc chấm điểm:
 - Trả về verdict = PARTIAL cho các trường hợp ở giữa.
 `;
 
-  constructor(private readonly openai: OpenAIService) {}
+  constructor(
+    private readonly openai: LlmGatewayService,
+    private readonly langfuseService: LangfuseService
+  ) {}
 
   /**
    * Evaluate the quality of a generated RAG answer
@@ -56,6 +61,15 @@ Hãy thực hiện đánh giá và trả về kết quả theo định dạng y�
       );
 
       this.logger.log(`Evaluation result: ${result.verdict} (Groundedness: ${result.groundedness}, Hallucination: ${result.hallucination_risk})`);
+      
+      try {
+        this.langfuseService.logEvaluation({ name: 'groundedness', value: result.groundedness });
+        this.langfuseService.logEvaluation({ name: 'completeness', value: result.completeness });
+        this.langfuseService.logEvaluation({ name: 'hallucination_risk', value: result.hallucination_risk });
+      } catch (err: any) {
+        this.logger.warn(`Failed to log evaluation to Langfuse: ${err.message}`);
+      }
+
       return result;
     } catch (err: any) {
       this.logger.error(`Critic evaluation failed: ${err.message}`);

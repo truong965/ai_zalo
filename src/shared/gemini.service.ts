@@ -1,6 +1,7 @@
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenerativeAI, TaskType, GenerativeModel } from '@google/generative-ai';
+import { AbortUtils } from './abort.utils';
 
 @Injectable()
 export class GeminiService implements OnModuleInit {
@@ -54,6 +55,10 @@ export class GeminiService implements OnModuleInit {
 
       return result.embedding.values;
     } catch (err: any) {
+      if (AbortUtils.isAbortError(err)) {
+        this.logger.debug(`Gemini embedding cancelled by user`);
+        throw err;
+      }
       this.logger.error(`Gemini embedding failed: ${err.message}`);
       throw err;
     }
@@ -61,63 +66,110 @@ export class GeminiService implements OnModuleInit {
 
   async generateText(
     prompt: string,
-    options?: { maxTokens?: number; temperature?: number },
+    options?: { maxTokens?: number; temperature?: number; signal?: AbortSignal },
   ): Promise<string> {
-    const startTime = Date.now();
-    try {
-      this.logger.debug(`Calling Gemini LLM...`);
+    const promise = (async () => {
+      const startTime = Date.now();
+      try {
+        this.logger.debug(`Calling Gemini LLM...`);
 
-      const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
-      const model = this.nextAI.getGenerativeModel({
-        model: modelName,
-        generationConfig: {
-          maxOutputTokens: options?.maxTokens,
-          temperature: options?.temperature ?? 0.7,
-        },
-      });
+        const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
+        const model = this.nextAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            maxOutputTokens: options?.maxTokens,
+            temperature: options?.temperature ?? 0.7,
+          },
+        });
 
-      const response = await model.generateContent(prompt);
-      const content = response.response.text();
+        const response = await model.generateContent(prompt);
+        const content = response.response.text();
 
-      const duration = Date.now() - startTime;
-      this.logger.debug(`Gemini LLM responded in ${duration}ms`);
+        const duration = Date.now() - startTime;
+        this.logger.debug(`Gemini LLM responded in ${duration}ms`);
 
-      return content;
-    } catch (err: any) {
-      this.logger.error(`Gemini generation failed after ${Date.now() - startTime}ms: ${err.message}`);
-      throw err;
-    }
+        return content;
+      } catch (err: any) {
+        if (AbortUtils.isAbortError(err)) {
+          this.logger.debug(`Gemini generation cancelled by user after ${Date.now() - startTime}ms`);
+          throw err;
+        }
+        this.logger.error(`Gemini generation failed after ${Date.now() - startTime}ms: ${err.message}`);
+        throw err;
+      }
+    })();
+    return AbortUtils.withAbort(promise, options?.signal);
   }
 
+  /**
+   * Legacy compatibility wrapper: streams only the final text output.
+   */
   async *streamText(
     prompt: string,
-    options?: { maxTokens?: number; temperature?: number },
+    options?: { maxTokens?: number; temperature?: number; signal?: AbortSignal },
   ): AsyncGenerator<string, void, unknown> {
-    const startTime = Date.now();
-    try {
-      this.logger.debug(`Streaming Gemini LLM...`);
-
-      const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
-      const model = this.nextAI.getGenerativeModel({
-        model: modelName,
-        generationConfig: {
-          maxOutputTokens: options?.maxTokens,
-          temperature: options?.temperature ?? 0.7,
-        },
-      });
-
-      const result = await model.generateContentStream(prompt);
-
-      for await (const chunk of result.stream) {
-        const text = chunk.text();
-        if (text) yield text;
+    const stream = (async function* (this: GeminiService) {
+      for await (const chunk of this.streamTextWithThinking(prompt, options)) {
+        if (chunk.type === 'text') {
+          yield chunk.text;
+        }
       }
+    }).call(this);
+    yield* AbortUtils.abortableStream(stream, options?.signal);
+  }
 
-      const duration = Date.now() - startTime;
-      this.logger.debug(`Gemini LLM stream completed in ${duration}ms`);
-    } catch (err: any) {
-      this.logger.error(`Gemini stream failed after ${Date.now() - startTime}ms: ${err.message}`);
-      throw err;
-    }
+  async *streamTextWithThinking(
+    prompt: string,
+    options?: { maxTokens?: number; temperature?: number; thinkingBudget?: number; signal?: AbortSignal },
+  ): AsyncGenerator<{ type: 'thought' | 'text'; text: string }, void, unknown> {
+    const stream = (async function* (this: GeminiService) {
+      const startTime = Date.now();
+      try {
+        this.logger.debug(`Streaming Gemini LLM with thinking...`);
+
+        const modelName = this.configService.get<string>('GEMINI_LLM_MODEL', 'gemini-1.5-flash');
+        
+        // Use thinking config if budget is provided or default to dynamic (-1)
+        const thinkingConfig = {
+          includeThoughts: true,
+          thinkingBudget: options?.thinkingBudget ?? -1,
+        };
+
+        const model = this.nextAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            maxOutputTokens: options?.maxTokens,
+            temperature: options?.temperature ?? 0.7,
+            thinkingConfig,
+          } as any,
+        });
+
+        const result = await model.generateContentStream(prompt);
+
+        for await (const chunk of result.stream) {
+          const candidate = chunk.candidates?.[0];
+          if (!candidate?.content?.parts) continue;
+
+          for (const part of candidate.content.parts) {
+            if ((part as any).thought && part.text) {
+              yield { type: 'thought', text: part.text };
+            } else if (part.text) {
+              yield { type: 'text', text: part.text };
+            }
+          }
+        }
+
+        const duration = Date.now() - startTime;
+        this.logger.debug(`Gemini LLM stream with thinking completed in ${duration}ms`);
+      } catch (err: any) {
+        if (AbortUtils.isAbortError(err)) {
+          this.logger.debug(`Gemini thinking stream cancelled by user after ${Date.now() - startTime}ms`);
+          throw err;
+        }
+        this.logger.error(`Gemini thinking stream failed after ${Date.now() - startTime}ms: ${err.message}`);
+        throw err;
+      }
+    }).call(this);
+    yield* AbortUtils.abortableStream(stream, options?.signal);
   }
 }
