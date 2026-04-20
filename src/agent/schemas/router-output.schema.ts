@@ -20,6 +20,14 @@ export const RouterOutputSchema = z.object({
       .describe('UUID của tin nhắn cần dịch nếu intent là translate. Nếu không có, để null.'),
     searchQuery: z.string().nullable()
       .describe('Câu truy vấn đã được tối ưu hóa để tìm kiếm trong lịch sử chat nếu intent là ask. Nếu không có, để null.'),
+    startDate: z.string().nullable()
+      .describe('Thời điểm bắt đầu (ISO 8601) nếu câu hỏi có chứa thông tin thời gian (VD: "hôm qua", "từ sáng", "2 tiếng trước"). Nếu không, để null.'),
+    endDate: z.string().nullable()
+      .describe('Thời điểm kết thúc (ISO 8601). Thường để null hoặc gán bằng thời gian hiện tại nếu truy vấn kết thúc ở hiện tại.'),
+    startMessageId: z.string().nullable()
+      .describe('ID tin nhắn bắt đầu nếu người dùng chỉ định. Mặc định null.'),
+    endMessageId: z.string().nullable()
+      .describe('ID tin nhắn kết thúc nếu người dùng chỉ định. Mặc định null.'),
   }).describe('Các tham số bổ sung được trích xuất từ câu hỏi.'),
 });
 

@@ -362,18 +362,27 @@ export class AgentService {
           type: route.intent as BotTriggerType,
           targetLang: route.params.targetLang ?? undefined,
           text: route.params.searchQuery || text,
+          startDate: route.params.startDate ?? undefined,
+          endDate: route.params.endDate ?? undefined,
+          startMessageId: route.params.startMessageId ?? undefined,
+          endMessageId: route.params.endMessageId ?? undefined,
         }, {
           emitUnifiedEvents: true, // Enable streaming from tools
           signal: abortController?.signal,
         });
 
-        const answer = toolResult.answer || toolResult.summary || toolResult.translatedText || 'Xong!';
-        
-        return {
-          answer,
-          intent: route.intent,
-          confidence: route.confidence
-        };
+        if (route.intent === BotTriggerType.SUMMARY && toolResult.messageCount === 0) {
+          this.logger.log(`Fast-track summary returned 0 messages. Lowering confidence and falling back to Agent Graph...`);
+          // Bypass returning to let it fall through to Tier 4
+        } else {
+          const answer = toolResult.answer || toolResult.summary || toolResult.translatedText || 'Xong!';
+          
+          return {
+            answer,
+            intent: route.intent,
+            confidence: route.confidence
+          };
+        }
       }
 
       // 5. Policy Tier 4: Mid-High confidence (>= 0.6) -> AUTONOMOUS GRAPH

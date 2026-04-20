@@ -37,7 +37,12 @@ export class EmbedWorkerService {
         userId: data.userId,
       });
 
-      const history = ((recentMessagesRaw as any[]) || []).reverse();
+      const historyRaw = ((recentMessagesRaw as any[]) || []);
+      // 1. Remove current message if it's already in history (prevents duplication)
+      // and reverse to get chronological order [oldest -> newest]
+      const history = historyRaw
+        .filter(m => m.id.toString() !== data.messageId.toString())
+        .reverse();
       
       // 2. Build the window text (Current message + recent context)
       // This helps capturing the conversation flow in the embedding

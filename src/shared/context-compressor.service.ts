@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { GeminiService } from './gemini.service';
+import { LlmGatewayService } from './llm-gateway.service';
 
 @Injectable()
 export class ContextCompressorService {
@@ -8,11 +8,11 @@ export class ContextCompressorService {
 
   constructor(
     private readonly configService: ConfigService,
-    private readonly geminiService: GeminiService,
+    private readonly llmGateway: LlmGatewayService,
   ) { }
 
   /**
-   * Compresses retrieved context to only the most relevant parts using Gemini.
+   * Compresses retrieved context to only the most relevant parts.
    * This reduces prompt length and focuses the LLM on specific information.
    */
   async compress(params: {
@@ -32,7 +32,7 @@ export class ContextCompressorService {
     }
 
     try {
-      this.logger.debug(`Compressing context with Gemini for query: "${params.question}" (${params.contexts.length} chunks)`);
+      this.logger.debug(`Compressing context with LLM for query: "${params.question}" (${params.contexts.length} chunks)`);
 
       const prompt = `Bạn là một chuyên gia nén ngữ cảnh RAG cho ứng dụng chat. 
 Nhiệm vụ của bạn là trích xuất các thông tin/câu/đoạn quan trọng nhất từ NGỮ CẢNH dưới đây để trả lời CÂU HỎI. 
@@ -51,7 +51,7 @@ ${params.contexts.join('\n\n---\n\n')}
 
 Phần nén:`;
 
-      const compressedContext = await this.geminiService.generateText(prompt, {
+      const compressedContext = await this.llmGateway.generateText(prompt, {
         temperature: 0.1,
         maxTokens: params.maxTokens
       });
@@ -62,7 +62,7 @@ Phần nén:`;
         return params.contexts.join('\n\n---\n\n');
       }
 
-      this.logger.log(`Context compressed with Gemini. Chars: ${compressedContext.length} (Original: ${totalLength})`);
+      this.logger.log(`Context compressed with LLM. Chars: ${compressedContext.length} (Original: ${totalLength})`);
       return compressedContext;
     } catch (err: any) {
       this.logger.error(`Context compression failed: ${err.message}. Falling back to full context.`);

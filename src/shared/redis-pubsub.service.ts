@@ -39,15 +39,16 @@ export class RedisPubsubService implements OnModuleInit, OnModuleDestroy {
 
       try {
         const payload = JSON.parse(message);
-        const { messageId, conversationId, userId, text, createdAt } = payload;
+        const { messageId, conversationId, userId, text, createdAt, senderName } = payload;
 
-        this.logger.debug(`New message in ${conversationId}: ${messageId}`);
+        this.logger.debug(`New message in ${conversationId}: ${messageId} (from: ${senderName})`);
 
         const jobData = {
           messageId,
           conversationId,
           userId,
           text,
+          senderName, // Extract and pass to job
           createdAt,
         };
 

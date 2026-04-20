@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { GeminiService } from '../shared/gemini.service';
+import { LlmGatewayService } from '../shared/llm-gateway.service';
 import { InternalClientService } from '../internal-client/internal-client.service';
 import { SessionCacheService } from '../sessions/session-cache.service';
 import {
@@ -31,7 +31,7 @@ export class TranslateService {
   };
 
   constructor(
-    private readonly gemini: GeminiService,
+    private readonly llm: LlmGatewayService,
     private readonly internalClient: InternalClientService,
     private readonly sessionCache: SessionCacheService,
   ) { }
@@ -108,7 +108,7 @@ export class TranslateService {
         sourceLang: 'auto',
         targetLang: normalizedTarget,
         skipped: false,
-        engine: 'gemini',
+        engine: 'llm-gateway',
         fromCache: false,
       };
 
@@ -124,7 +124,7 @@ export class TranslateService {
       return result;
     } catch (err: any) {
       const duration = Date.now() - startTime;
-      this.logger.error(`Gemini translation failed after ${duration}ms: ${err.message}`);
+      this.logger.error(`LLM translation failed after ${duration}ms: ${err.message}`);
 
       if (err.message?.includes('timeout') || err.message?.includes('AbortError')) {
         throw new TranslateError(`Dịch thuật bị quá hạn (timeout). Có thể do máy chủ đang quá tải. Vui lòng thử lại sau.`);
@@ -148,7 +148,7 @@ export class TranslateService {
 Nội dung cần dịch:
 ${text}`;
 
-    return await this.gemini.generateText(prompt);
+    return await this.llm.generateText(prompt);
   }
 
   private detectLikelySourceLang(text: string): 'vi' | 'en' | 'unknown' {

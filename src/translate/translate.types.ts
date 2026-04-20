@@ -4,7 +4,7 @@ export interface TranslateResult {
   sourceLang: string;
   targetLang: string;
   skipped: boolean;
-  engine: 'gemini' | 'ollama' | 'none';
+  engine: 'gemini' | 'ollama' | 'none' | 'llm-gateway';
   sessionId?: string;
   fromCache?: boolean;
 }

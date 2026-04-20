@@ -87,6 +87,7 @@ import { AppController } from './app.controller';
           port: config.get<number>('REDIS_PORT'),
           password: config.get<string>('REDIS_PASSWORD'),
           db: config.get<number>('REDIS_DB'),
+          maxRetriesPerRequest: null,
         },
       }),
     }),

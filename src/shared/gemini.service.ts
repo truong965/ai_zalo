@@ -140,8 +140,10 @@ export class GeminiService implements OnModuleInit {
           generationConfig: {
             maxOutputTokens: options?.maxTokens,
             temperature: options?.temperature ?? 0.7,
-            thinkingConfig,
-          } as any,
+          },
+          // thinkingConfig is a top-level field, NOT inside generationConfig
+          // Supported by gemini-2.5-flash and newer thinking models
+          ...(thinkingConfig ? { thinkingConfig } as any : {}),
         });
 
         const result = await model.generateContentStream(prompt);

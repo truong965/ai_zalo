@@ -13,7 +13,7 @@ async function backfillConversation() {
 
   // Usage: npm run backfill-conv <CONV_ID> [--clear]
   const args = process.argv.slice(2);
-  const CONV_ID = args[0] || '32cb3ae2-5fa9-42d4-9036-233651bd0edb';
+  const CONV_ID = args[0] || 'd27decd3-2a81-429f-b6d8-198b353aab49';
   const shouldClear = args.includes('--clear');
 
   logger.log(`Starting prioritized backfill for conversation: ${CONV_ID}...`);

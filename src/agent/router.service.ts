@@ -3,16 +3,20 @@ import { LlmGatewayService } from '../shared/llm-gateway.service';
 import { RouterOutput, RouterOutputSchema } from './schemas/router-output.schema';
 import Redis from 'ioredis';
 import * as crypto from 'crypto';
-import { AbortUtils } from 'src/shared/abort.utils';
+import { AbortUtils } from '../shared/abort.utils';
+
+import { LangfuseCallbackProvider } from '../shared/langfuse-callback.provider';
 
 @Injectable()
 export class RouterService {
   private readonly logger = new Logger(RouterService.name);
   private readonly CACHE_TTL = 3600; // 1 hour for intent routing cache
 
-  private readonly SYSTEM_PROMPT = `
+  private get SYSTEM_PROMPT() {
+    return `
 Bạn là một bộ phân loại intent cho ứng dụng chat AI assistant (ai_zalo). 
 Phân tích câu hỏi của người dùng và xác định intent phù hợp nhất để hệ thống có thể kích hoạt đúng công cụ.
+Thời gian hiện tại của hệ thống: ${new Date().toISOString()}
 
 Các intent có sẵn:
 1. "ask": Người dùng hỏi về nội dung, thông tin, hoặc những gì đã được thảo luận trong lịch sử chat. 
@@ -32,11 +36,14 @@ Yêu cầu:
 - Trả về confidence thấp (< 0.7) nếu bạn không chắc chắn.
 - Nếu là intent "ask", hãy viết lại câu hỏi người dùng thành một search query ngắn gọn, súc tích trong trường params.searchQuery.
 - Nếu là intent "translate", hãy cố gắng trích xuất targetLang (vi, en, ja, ko, zh, fr, de, es, th) trong trường params.targetLang.
+- NẾU người dùng hỏi kèm thời gian (VD: "hôm nay", "từ sáng", "tuần trước"), HÃY BẮT BUỘC TRÍCH XUẤT ra startDate và endDate dưới dạng ISO 8601 string chuẩn xác. Dùng "Thời gian hiện tại" để tính toán.
 `;
+  }
 
   constructor(
     private readonly openai: LlmGatewayService,
     @Inject('REDIS_CLIENT') private readonly redis: Redis,
+    private readonly langfuseCallback: LangfuseCallbackProvider,
   ) { }
 
   /**
@@ -77,23 +84,20 @@ ${context?.conversationId ? `Conversation ID: ${context.conversationId}` : ''}
 
     try {
       let result: RouterOutput;
+      const callbacks = this.langfuseCallback?.handler ? [this.langfuseCallback.handler] : undefined;
 
-      if (onThought) {
-        result = await this.openai.structuredStream(
-          this.SYSTEM_PROMPT + prompt,
-          RouterOutputSchema,
-          'router_output',
-          onThought,
-          { signal: context?.signal }
-        );
-      } else {
-        result = await this.openai.structured(
-          this.SYSTEM_PROMPT + prompt,
-          RouterOutputSchema,
-          'router_output',
-          { signal: context?.signal }
-        );
-      }
+      const structuredModel = this.openai.getLangchainModel({ 
+        temperature: 0,
+        structuredSchema: RouterOutputSchema,
+        structuredName: 'router_output'
+      });
+      
+      const response = await (structuredModel as any).invoke(this.SYSTEM_PROMPT + prompt, { 
+        signal: context?.signal,
+        callbacks 
+      });
+
+      result = response as RouterOutput;
 
       this.logger.log(`Intent classified: ${result.intent} (Confidence: ${result.confidence})`);
 
@@ -120,6 +124,10 @@ ${context?.conversationId ? `Conversation ID: ${context.conversationId}` : ''}
           targetLang: null,
           messageId: null,
           searchQuery: null,
+          startDate: null,
+          endDate: null,
+          startMessageId: null,
+          endMessageId: null,
         },
       };
     }
