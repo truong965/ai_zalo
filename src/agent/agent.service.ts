@@ -376,6 +376,18 @@ export class AgentService {
           // Bypass returning to let it fall through to Tier 4
         } else {
           const answer = toolResult.answer || toolResult.summary || toolResult.translatedText || 'Xong!';
+
+          if (route.intent === BotTriggerType.TRANSLATE) {
+            await this.internalClient.notifyUnifiedResponse({
+              conversationId,
+              userId,
+              event: AIUnifiedResponseEvents.COMPLETED,
+              payload: {
+                ...unifiedBase,
+                content: answer,
+              },
+            });
+          }
           
           return {
             answer,

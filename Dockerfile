@@ -3,7 +3,10 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install
+COPY prisma ./prisma
+COPY prisma.config.ts ./
+RUN npm ci --legacy-peer-deps --ignore-scripts
+RUN AI_DATABASE_URL="postgresql://postgres:postgres@localhost:5432/ai_zalo_db?schema=public" npx prisma generate
 
 COPY . .
 RUN npm run build
@@ -15,7 +18,9 @@ WORKDIR /app
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 
 EXPOSE 3001
 
-CMD ["node", "dist/main"]
+CMD ["node", "dist/src/main.js"]
